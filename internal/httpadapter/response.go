@@ -6,92 +6,183 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
+var ErrResponseClosed = errors.New("orbit-go: response writer is closed")
 var ErrResponseTooLarge = errors.New("orbit-go: response exceeds MaxResponseBytes")
-var ErrUnsupportedResponse = errors.New("orbit-go: streaming, informational responses and trailers are not supported in this stage")
+var ErrUnsupportedResponse = errors.New("orbit-go: informational responses and trailers are not supported")
 
-// ResponseWriter is the first-stage bounded response adapter. It implements
-// only http.ResponseWriter, with no streaming, hijacking or push interfaces.
-type ResponseWriter struct {
-	header    http.Header
-	committed http.Header
-	status    int
-	body      []byte
-	limit     uint64
-	head      bool
-	err       error
+// Sink acknowledges transport operations after the bounded native writer accepts
+// them. Finish sends FIN; Abort resets an already committed response.
+type Sink interface {
+	Head(int, http.Header) error
+	Write([]byte) (int, error)
+	Finish() error
+	Abort()
 }
 
-func NewResponseWriter(maxBytes uint64, head bool) *ResponseWriter {
-	return &ResponseWriter{header: make(http.Header), limit: maxBytes, head: head}
+// ResponseWriter sends each write immediately and implements http.Flusher.
+// Header mutation follows net/http's usual handler-owned concurrency contract.
+type ResponseWriter struct {
+	mu             sync.Mutex
+	sink           Sink
+	header         http.Header
+	committed      bool
+	status         int
+	total          uint64
+	limit          uint64
+	length         int64
+	head, finished bool
+	err            error
+}
+
+func NewResponseWriter(sink Sink, maxBytes uint64, head bool) *ResponseWriter {
+	return &ResponseWriter{sink: sink, header: make(http.Header), limit: maxBytes, length: -1, head: head}
 }
 func (w *ResponseWriter) Header() http.Header { return w.header }
+func (w *ResponseWriter) commit(status int) error {
+	if status < 200 || status > 599 {
+		return ErrUnsupportedResponse
+	}
+	for key := range w.header {
+		if strings.EqualFold(key, "Trailer") || strings.EqualFold(key, "Transfer-Encoding") || strings.HasPrefix(key, http.TrailerPrefix) {
+			return ErrUnsupportedResponse
+		}
+	}
+	if values := w.header.Values("Content-Length"); len(values) > 0 {
+		if len(values) != 1 {
+			return fmt.Errorf("orbit-go: multiple Content-Length values")
+		}
+		n, err := strconv.ParseInt(values[0], 10, 64)
+		if err != nil || n < 0 {
+			return fmt.Errorf("orbit-go: invalid Content-Length")
+		}
+		w.length = n
+	}
+	w.status = status
+	w.committed = true
+	return w.sink.Head(status, w.header.Clone())
+}
 func (w *ResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if status < 100 || status > 999 {
 		panic("invalid HTTP response status")
 	}
-	if w.status != 0 {
+	if w.committed || w.finished || w.err != nil {
 		return
 	}
-	if status < 200 || status > 599 {
-		w.err = ErrUnsupportedResponse
-		return
-	}
-	w.status = status
-	w.committed = w.header.Clone()
-	if len(w.committed.Values("Trailer")) != 0 {
-		w.err = ErrUnsupportedResponse
-	}
-	for key := range w.committed {
-		if strings.HasPrefix(key, http.TrailerPrefix) {
-			w.err = ErrUnsupportedResponse
-		}
-	}
+	w.err = w.commit(status)
 }
 func (w *ResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return 0, ErrResponseClosed
+	}
 	if w.err != nil {
 		return 0, w.err
 	}
-	if w.status == 0 {
+	if w.limit != 0 && uint64(len(p)) > w.limit-w.total {
+		w.err = ErrResponseTooLarge
+		return 0, w.err
+	}
+	if w.length >= 0 && uint64(len(p)) > uint64(w.length)-w.total {
+		return 0, http.ErrContentLength
+	}
+	if !w.committed {
 		if w.header.Get("Content-Type") == "" && w.header.Get("Content-Encoding") == "" && len(p) > 0 {
 			w.header.Set("Content-Type", http.DetectContentType(p))
 		}
-		w.WriteHeader(http.StatusOK)
-	}
-	if w.err != nil {
-		return 0, w.err
+		w.err = w.commit(http.StatusOK)
+		if w.err != nil {
+			return 0, w.err
+		}
+		// commit may have obtained a caller-declared length.
+		if w.length >= 0 && uint64(len(p)) > uint64(w.length)-w.total {
+			w.err = http.ErrContentLength
+			return 0, w.err
+		}
 	}
 	if w.status == http.StatusNoContent || w.status == http.StatusNotModified {
 		return 0, http.ErrBodyNotAllowed
 	}
-	if uint64(len(p)) > w.limit-uint64(len(w.body)) {
-		w.err = ErrResponseTooLarge
-		return 0, w.err
+	if w.head {
+		w.total += uint64(len(p))
+		return len(p), nil
 	}
-	w.body = append(w.body, p...)
-	return len(p), nil
+	n, err := w.sink.Write(p)
+	w.total += uint64(n)
+	w.err = err
+	return n, err
 }
-
-// Response returns the committed buffered reply. It is valid after the handler
-// returns; do not mutate the returned body or writer concurrently with serving.
-func (w *ResponseWriter) Response() (int, http.Header, []byte, error) {
-	if w.status == 0 {
-		w.WriteHeader(http.StatusOK)
+func (w *ResponseWriter) Flush() { _ = w.FlushError() }
+func (w *ResponseWriter) FlushError() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return ErrResponseClosed
 	}
 	if w.err != nil {
-		return 0, nil, nil, w.err
+		return w.err
 	}
-	if length := w.committed.Get("Content-Length"); length != "" {
-		n, err := strconv.ParseUint(length, 10, 64)
-		if err != nil || (!w.head && n != uint64(len(w.body))) {
-			return 0, nil, nil, fmt.Errorf("orbit-go: invalid response Content-Length")
+	if !w.committed {
+		w.err = w.commit(http.StatusOK)
+	}
+	return w.err
+}
+
+// Reads and writes already have independent native owners.
+func (w *ResponseWriter) EnableFullDuplex() error { return nil }
+
+// Finish is called after the handler returns. A pre-head failure can become a
+// final error response; after a committed head, failure must reset the stream.
+func (w *ResponseWriter) Finish(failureStatus int, abort bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return w.err
+	}
+	w.finished = true
+	if abort {
+		w.sink.Abort()
+		return w.err
+	}
+	if failureStatus == 0 && w.err != nil {
+		failureStatus = 500
+	}
+	if failureStatus != 0 {
+		if w.committed {
+			w.sink.Abort()
+			return w.err
 		}
-	} else if w.status != http.StatusNoContent && w.status != http.StatusNotModified {
-		w.committed.Set("Content-Length", strconv.Itoa(len(w.body)))
+		w.header = make(http.Header)
+		w.length = -1
+		w.err = w.commit(failureStatus)
 	}
-	if w.head {
-		return w.status, w.committed, nil, nil
+	if !w.committed && w.err == nil {
+		w.err = w.commit(http.StatusOK)
 	}
-	return w.status, w.committed, w.body, nil
+	if w.length >= 0 && !w.head && w.total != uint64(w.length) {
+		w.err = http.ErrContentLength
+	}
+	if w.err != nil {
+		w.sink.Abort()
+		return w.err
+	}
+	w.err = w.sink.Finish()
+	if w.err != nil {
+		w.sink.Abort()
+	}
+	return w.err
+}
+
+func (w *ResponseWriter) CommittedStatus() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.committed {
+		return 0
+	}
+	return w.status
 }

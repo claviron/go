@@ -1,13 +1,15 @@
 package orbitgo
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/claviron/orbit-go/internal/httpadapter"
@@ -35,7 +37,7 @@ func Scheme(r *http.Request) string {
 	return data.scheme
 }
 
-func requestFromNative(input native.Request, ctx context.Context) (*http.Request, error) {
+func requestFromNative(input native.Request, body io.ReadCloser, ctx context.Context) (*http.Request, error) {
 	target := input.Path
 	if input.Query != "" {
 		target += "?" + input.Query
@@ -69,46 +71,117 @@ func requestFromNative(input native.Request, ctx context.Context) (*http.Request
 	}
 	metadata := requestMetadata{headers: raw, scheme: input.Scheme}
 	ctx = context.WithValue(ctx, metadataKey{}, metadata)
-	if address, err := net.ResolveTCPAddr("tcp", input.Local); input.Local != "" && err == nil {
-		ctx = context.WithValue(ctx, http.LocalAddrContextKey, address)
+	if address, err := netip.ParseAddrPort(input.Local); err == nil {
+		ctx = context.WithValue(ctx, http.LocalAddrContextKey, net.TCPAddrFromAddrPort(address))
 	}
-	var body io.ReadCloser = http.NoBody
-	if len(input.Body) > 0 {
-		body = io.NopCloser(bytes.NewReader(input.Body))
+	length := int64(-1)
+	if !input.HasBodyStream {
+		body = http.NoBody
+		length = 0
+	}
+	if values := headers.Values("Content-Length"); len(values) > 0 {
+		if len(values) != 1 {
+			return nil, fmt.Errorf("multiple Content-Length values")
+		}
+		n, err := strconv.ParseInt(values[0], 10, 64)
+		if err != nil || n < 0 {
+			return nil, fmt.Errorf("invalid Content-Length")
+		}
+		length = n
+		if length == 0 {
+			body = http.NoBody
+		}
+	}
+	if headers.Get("Trailer") != "" {
+		return nil, httpadapter.ErrUnsupportedResponse
 	}
 	r := &http.Request{Method: input.Method, URL: parsed, Proto: fmt.Sprintf("HTTP/%d.%d", input.Major, input.Minor), ProtoMajor: input.Major, ProtoMinor: input.Minor,
 		Header: headers, Host: host, RemoteAddr: input.Peer, RequestURI: target,
-		Body: body, ContentLength: int64(len(input.Body))}
+		Body: body, ContentLength: length}
 	return r.WithContext(ctx), nil
 }
 
 func (a *Application) dispatch(id native.Handle, input native.Request, ctx context.Context, mappingError error) {
 	defer a.workers.Done()
 	defer a.complete(id, true)
-	request, err := requestFromNative(input, ctx)
+	body := &inputBody{app: a, id: id}
+	defer body.Close()
+	sink := &nativeSink{app: a, id: id}
+	writer := httpadapter.NewResponseWriter(sink, a.options.MaxResponseBytes, input.Method == http.MethodHead)
+	request, err := requestFromNative(input, body, ctx)
 	if mappingError != nil || err != nil {
-		_ = native.Reply(id, 400, nil, nil)
+		status := 400
+		if errors.Is(err, httpadapter.ErrUnsupportedResponse) {
+			status = 501
+		}
+		_ = writer.Finish(status, false)
 		return
 	}
-	defer request.Body.Close()
-	writer := httpadapter.NewResponseWriter(a.options.MaxResponseBytes, request.Method == http.MethodHead)
+	if a.options.MaxRequestBytes != 0 && request.ContentLength > int64(a.options.MaxRequestBytes) {
+		_ = writer.Finish(413, false)
+		return
+	}
 	aborted, panicked := false, false
 	func() {
+		completed := false
 		defer func() {
-			if value := recover(); value != nil {
+			if !completed {
+				value := recover()
 				aborted = value == http.ErrAbortHandler
 				panicked = true
 			}
 		}()
 		a.handler.ServeHTTP(writer, request)
+		completed = true
 	}()
-	if aborted || ctx.Err() != nil {
-		_ = native.Abort(id)
-		return
+	// Close input independently: a response may deliberately finish before an
+	// upload. Existing pending reads receive their own completion before release.
+	_ = body.Close()
+	failure := 0
+	if panicked {
+		failure = 500
+	} else {
+		var limit *http.MaxBytesError
+		if errors.As(body.failure(), &limit) && writer.CommittedStatus() < 400 {
+			failure = 413
+		}
 	}
-	status, headers, body, err := writer.Response()
-	if panicked || err != nil {
-		status, headers, body = 500, nil, nil
+	_ = writer.Finish(failure, aborted || ctx.Err() != nil)
+}
+
+type nativeSink struct {
+	app *Application
+	id  native.Handle
+}
+
+func (s *nativeSink) Head(status int, headers http.Header) error {
+	_, err := s.app.ioOperation(s.id, false, func() error { return native.Head(s.id, status, headers) }, func() (int, error) { return native.OutputResult(s.id) })
+	return err
+}
+func (s *nativeSink) Write(data []byte) (int, error) {
+	total := 0
+	for len(data) > 0 {
+		chunk := data[:min(len(data), int(s.app.options.IOBufferBytes))]
+		n, err := s.app.ioOperation(s.id, false, func() error { return native.Write(s.id, chunk) }, func() (int, error) { return native.OutputResult(s.id) })
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n != len(chunk) {
+			return total, io.ErrShortWrite
+		}
+		data = data[n:]
 	}
-	_ = native.Reply(id, status, headers, body)
+	return total, nil
+}
+func (s *nativeSink) Finish() error {
+	_, err := s.app.ioOperation(s.id, false, func() error { return native.Finish(s.id) }, func() (int, error) { return native.OutputResult(s.id) })
+	return err
+}
+func (s *nativeSink) Abort() {
+	s.app.mu.Lock()
+	defer s.app.mu.Unlock()
+	if s.app.active[s.id] != nil {
+		_ = native.Abort(s.id)
+	}
 }

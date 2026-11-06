@@ -16,12 +16,15 @@ in Go. The separate direct-integration Go FFI project is not a dependency.
 
 - `application.go`: Go application ownership, completion pump and shutdown.
 - `http.go`: server request mapping, raw headers and handler dispatch.
+- `body.go`: lazy, serialized reads and concurrent input closure.
 - `internal/native/native.go`: private cgo calls and copy-out metadata.
-- `internal/httpadapter/response.go`: bounded first-stage response buffering.
-- `native/include/orbit_go.h`: ABI version one and ownership rules.
+- `internal/httpadapter/response.go`: streaming response ownership and net/http behavior.
+- `internal/native/orbit_go.h`: ABI version two and ownership rules.
 - `native/src/abi.rs`: checked downcalls and unwind containment.
 - `native/src/registry.rs`: never-reused, kind-checked application/exchange handles.
-- `native/src/application.rs`: Link reader, native I/O and terminal delivery.
+- `native/src/application.rs`: Link membership, frame dispatch and application drain.
+- `native/src/application/io.rs`: independent input/output actors, operation slots
+  and terminal exchange completion.
 - `native/src/application/status.rs`: existing application status schema, with
   Go identity and `net/http` request mode. No custom runner is reported.
 - `examples/plain/main.go`: an ordinary Go application using the library.
@@ -39,46 +42,71 @@ the application, not one per request. It dispatches requests to Go goroutines;
 it never executes user handlers. Native read/write work returns by terminal
 events, rather than by blocking a handler in cgo for the duration of I/O.
 
-`MaxExchanges` bounds retained exchange handles. Each credit reserves space for
-at most Request, Cancelled and Complete; one extra queue slot belongs to Closed.
-A native completion therefore never waits for data-queue space and is never
-discarded. The credit remains reserved until Go has observed native completion
-and the handler has returned. Release before terminal completion is rejected.
-This is one exchange ownership budget, not a second permit over the same queue.
-Full exchange admission sends an empty 503 and does not evict an older exchange.
+`MaxExchanges` bounds retained exchange handles. Each credit reserves Request,
+Cancelled, Complete and at most one unconsumed Read result and Output result;
+one additional queue slot belongs to Closed. Each direction admits one operation
+at a time. A result becomes reusable only after its event has been delivered AND
+its data/status consumed. Terminal delivery is also checked before release.
+This prevents early result consumption from recycling credit while old events
+remain queued. No terminal completion is discarded or waits for data-queue space.
 
-Every accepted exchange has one terminal completion, including body refusal,
-peer cancellation and failed head publication. Native failure also cancels the
-Go request context. No Go pointer is retained across a downcall. Copy-out calls
-pin their native owner for the call and expose no borrowed native pointer.
-Response headers/body are copied into native ownership before submission returns.
-Submission success means accepted work; it does not mean delivery succeeded.
+Go pins an exchange for each operation through native result consumption. Release
+requires native completion, handler return and zero Go I/O leases. Application
+closure joins handlers and I/O consumers before releasing the native runtime.
+Full exchange admission sends an empty 503 without evicting an older exchange.
+
+Read and output use separate native actors and command slots. The input owner
+reads only on Go demand, at most IOBufferBytes, and reuses its buffer. Its result
+is copied directly into the caller's Go buffer. The output owner accepts one
+copied chunk of at most IOBufferBytes and acknowledges actual written bytes,
+including partial failure. No Go pointer survives an asynchronous downcall.
+
+The output actor alone owns response readiness, peer-departure observation and
+FIN/reset. It joins the input owner before reporting final exchange completion,
+including panic and cancellation paths. Input Close interrupts its own wait but
+never cancels output. Peer departure and explicit application Close cancel owned
+I/O and Request.Context. Both directions retain exactly one terminal result for
+a submission that races cancellation; unsubmitted work returns an immediate error.
 
 The ABI queries fixed record sizes and version before opening. Native Link
 geometry is reported separately, and mapping uses Claviron's existing geometry
 validation. A native ABI match is not proof of peer wire compatibility.
 
-## First-stage HTTP behavior
+## HTTP streaming behavior
 
-Request bodies are buffered up to `MaxRequestBytes`; larger requests receive
-413 before Go dispatch. Responses are buffered up to `MaxResponseBytes` and
-published after the handler returns. Buffers have bounded payload length;
-allocator capacity, metadata and the Go/native copies are additional memory.
-This stage is not a streaming or full-duplex handler adapter.
+ABI v2 dispatches after the request head and stream ownership are ready. It does
+not pre-read the complete upload. Request.Body serializes reads; Close signals
+the native input owner without waiting behind a blocked Read. Input EOF and
+read closure are independent of response FIN. A present stream without declared
+length has unknown ContentLength; no stream maps to http.NoBody. Declared length
+is used when supplied. Body presence is limited to what the Link envelope carries.
 
-Server requests preserve the original request target, method, HTTP version,
-Host, remote/local addresses, repeated headers and buffered body. `RawHeaders`
-retains order/casing that `http.Header` cannot represent. `Scheme` exposes the
-caller's scheme; Request.TLS stays nil because the application did not perform
-the public handshake. Trusted-forwarding policy is not reapplied.
+`IOBufferBytes` bounds each operation. Zero MaxRequestBytes/MaxResponseBytes
+means no total payload limit; configured nonzero totals are enforced separately.
+Memory is bounded by operation buffers, metadata and the shared stream windows,
+not by complete body size. A read crossing its limit returns the allowed prefix
+and a MaxBytesError; handlers can answer before consuming the rest of an upload.
 
-Response headers freeze at the first final status or write. An implicit status
-is 200. HEAD omits response bytes; 204/304 reject writes. Repeated response
-headers are preserved. A panic or response-budget error produces an empty 500;
-`http.ErrAbortHandler` resets the exchange. Header/publication failure resets
-the existing stream, so a caller waiting for the head wakes with an error.
-No optional streaming, hijacking or push interface is advertised. Informational
-responses, trailers, upgrades and general streaming are not implemented.
+ResponseWriter publishes head/write/FIN operations immediately and waits in Go
+for each native acknowledgement. It implements Flusher, FlushError and
+EnableFullDuplex. There is no hidden output buffer to flush; Flush publishes the
+head when necessary. Content-Length is enforced when declared; buffering is not
+used to infer one. HEAD omits body bytes; 204/304 reject writes.
+
+Header names/values and repeated fields retain their existing ownership rules.
+RawHeaders preserves request order and casing. The TLS connection belongs to
+Claviron, so only Scheme exposes the supplied scheme and Request.TLS stays nil.
+The adapter does not reapply trusted-forwarding policy.
+
+An unhandled request-limit error before commit becomes 413. A handler panic or
+output-limit error before commit becomes an empty 500. Once a final head is
+committed, failures reset the stream instead of inventing a replacement status.
+The caller's existing response reset signal wakes head/body waits on failure.
+The Link API supplies byte streams without a trailer envelope; trailers,
+informational responses, upgrades, hijacking and push are not advertised.
+
+The canonical ABI header is in internal/native so the Go package cache includes
+it. The binding checks v2 and fixed record sizes before opening; v1 is incompatible.
 
 ## Lifecycle scope
 
@@ -107,9 +135,11 @@ Rust test bodies live in `native/tests/`, mirroring modules; Go tests live under
 Go program; the Rust program represents the real Claviron caller.
 
 The acceptance driver waits for child readiness and lifecycle signals without
-sleeps. Its Go fixture uses the race detector; it can also run with
+sleeps. Its Go fixture and actual Go example use the race detector; it can also run with
 `GOEXPERIMENT=cgocheck2`. It checks real HTTP exchanges, concurrent instances,
-peer cancellation, handler failures, reply failures and graceful drain.
+peer cancellation, handler failures, reply failures and graceful drain. It proves
+a full upload window makes a further write pending, transfers more than a window,
+closes pending reads, and drains the actual example after SIGTERM.
 
 The external Python parent clears only the successful test's unique fleet,
 after the Rust caller and all Go children have exited. Failed runs retain their

@@ -1,4 +1,4 @@
-//! C ABI version one: checked handles, borrowed call inputs and copy-out data.
+//! C ABI version two: checked handles, borrowed call inputs and copy-out data.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -22,6 +22,7 @@ pub enum Status {
     Panic = 7,
     Busy = 8,
     Cancelled = 9,
+    Limit = 10,
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +32,8 @@ pub enum EventKind {
     Cancelled = 2,
     Complete = 3,
     Closed = 4,
+    Read = 5,
+    Output = 6,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -63,6 +66,7 @@ pub struct OpenOptions {
     pub max_exchanges: u64,
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
+    pub io_buffer_bytes: u64,
 }
 
 pub struct Options {
@@ -73,6 +77,7 @@ pub struct Options {
     pub max_exchanges: usize,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
+    pub io_buffer_bytes: usize,
 }
 
 impl Options {
@@ -80,12 +85,11 @@ impl Options {
         if self.native_threads == 0
             || self.incarnation == 0
             || self.max_exchanges == 0
-            || self.max_request_bytes == 0
-            || self.max_response_bytes == 0
-            || self.max_request_bytes == usize::MAX
+            || self.io_buffer_bytes == 0
+            || self.io_buffer_bytes > isize::MAX as usize
             || self
                 .max_exchanges
-                .checked_mul(3)
+                .checked_mul(5)
                 .and_then(|n| n.checked_add(1))
                 .is_none()
         {
@@ -104,8 +108,7 @@ pub struct RequestInfo {
     pub version_major: u32,
     pub version_minor: u32,
     pub header_count: u32,
-    pub reserved: u32,
-    pub body_bytes: u64,
+    pub body_stream: u32,
 }
 
 fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
@@ -172,7 +175,7 @@ unsafe fn copy_out(
 }
 
 /// # Safety
-/// All pointers obey native/include/orbit_go.h: aligned outputs, call-scoped
+/// All pointers obey internal/native/orbit_go.h: aligned outputs, call-scoped
 /// readable inputs and exclusive writable copy-out buffers. No input is retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {
@@ -180,7 +183,7 @@ pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {
         output(
             out,
             Abi {
-                version: 1,
+                version: 2,
                 event_size: size_of::<Event>() as u32,
                 options_size: size_of::<OpenOptions>() as u32,
                 info_size: size_of::<RequestInfo>() as u32,
@@ -214,7 +217,7 @@ pub unsafe extern "C" fn og_open(
             out.write(0);
         }
         let options = unsafe { &*options };
-        if options.abi_version != 1 {
+        if options.abi_version != 2 {
             return Err(Status::Unsupported);
         }
         let fleet = std::str::from_utf8(unsafe { bytes(fleet, fleet_len)? })
@@ -231,6 +234,8 @@ pub unsafe extern "C" fn og_open(
             max_request_bytes: usize::try_from(options.max_request_bytes)
                 .map_err(|_| Status::InvalidArgument)?,
             max_response_bytes: usize::try_from(options.max_response_bytes)
+                .map_err(|_| Status::InvalidArgument)?,
+            io_buffer_bytes: usize::try_from(options.io_buffer_bytes)
                 .map_err(|_| Status::InvalidArgument)?,
         })?;
         unsafe { output(out, registry::insert_application(application)?) }
@@ -305,9 +310,7 @@ pub unsafe extern "C" fn og_request_info(
             version_major: major,
             version_minor: minor,
             header_count: exchange.frame.headers.len() as u32,
-            reserved: 0,
-            body_bytes: exchange.body.lock().map_err(|_| Status::Panic)?.len()
-                as u64,
+            body_stream: u32::from(exchange.frame.body.is_some()),
         };
         unsafe { output(out, info) }
     })
@@ -315,7 +318,7 @@ pub unsafe extern "C" fn og_request_info(
 
 /// # Safety
 /// See copy-out contract in the C header. Fields: method, scheme, raw path,
-/// query, peer, local address, body, header name, header value (1 through 9).
+/// query, peer, local address, header name and header value (7 is reserved).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn og_request_copy(
     exchange: u64,
@@ -329,7 +332,6 @@ pub unsafe extern "C" fn og_request_copy(
         let exchange = registry::exchange(exchange)?;
         let frame = &exchange.frame;
         let address;
-        let body;
         let value = match field {
             1 => frame.method.as_bytes(),
             2 => frame.scheme.as_bytes(),
@@ -340,10 +342,6 @@ pub unsafe extern "C" fn og_request_copy(
                     .map(|value| value.to_string())
                     .unwrap_or_default();
                 address.as_bytes()
-            }
-            7 => {
-                body = exchange.body.lock().map_err(|_| Status::Panic)?;
-                &body
             }
             8 | 9 => {
                 let pair = frame
@@ -388,15 +386,16 @@ pub unsafe extern "C" fn og_reply_header(
 }
 
 /// # Safety
-/// body is call-scoped. Native copies it before returning and completes by event.
+/// body is a call-scoped chunk no larger than io_buffer_bytes. Native copies it
+/// before returning and completes through the output-result event.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn og_reply_submit(
+pub unsafe extern "C" fn og_output_write(
     exchange: u64,
     body: *const u8,
     length: u64,
 ) -> u32 {
     boundary(|| {
-        registry::exchange(exchange)?.submit(unsafe { bytes(body, length)? })
+        registry::exchange(exchange)?.write(unsafe { bytes(body, length)? })
     })
 }
 
@@ -434,5 +433,65 @@ pub unsafe extern "C" fn og_unsupported(
                 .unsupported
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn og_head_submit(exchange: u64) -> u32 {
+    boundary(|| registry::exchange(exchange)?.head())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn og_output_finish(exchange: u64) -> u32 {
+    boundary(|| registry::exchange(exchange)?.finish_output())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn og_read_start(
+    exchange: u64,
+    capacity: u64,
+) -> u32 {
+    boundary(|| {
+        registry::exchange(exchange)?.read(
+            usize::try_from(capacity).map_err(|_| Status::InvalidArgument)?,
+        )
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn og_read_close(exchange: u64) -> u32 {
+    boundary(|| {
+        registry::exchange(exchange)?.close_input();
+        Ok(())
+    })
+}
+/// # Safety
+/// out is writable for capacity bytes and length for one u64. Requires the read event.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_read_result(
+    exchange: u64,
+    out: *mut u8,
+    capacity: u64,
+    length: *mut u64,
+) -> u32 {
+    boundary(|| {
+        registry::exchange(exchange)?.read_result(|data| unsafe {
+            copy_out(data, out, capacity, length)
+        })
+    })
+}
+/// # Safety
+/// written is writable for one u64. Requires the output event.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_output_result(
+    exchange: u64,
+    written: *mut u64,
+) -> u32 {
+    boundary(|| {
+        if written.is_null() {
+            return Err(Status::InvalidArgument);
+        }
+        let (count, status) = registry::exchange(exchange)?.output_result()?;
+        unsafe {
+            output(written, count as u64)?;
+        }
+        if status == Status::Ok { Ok(()) } else { Err(status) }
     })
 }

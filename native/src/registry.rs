@@ -85,7 +85,7 @@ pub fn remove_exchange(
         if !Arc::ptr_eq(&owner.state, &exchange.application) {
             return Err(Status::InvalidHandle);
         }
-        if !exchange.finished() {
+        if !exchange.releasable() {
             return Err(Status::Busy);
         }
         registry.exchanges.remove(&id).ok_or(Status::InvalidHandle)?

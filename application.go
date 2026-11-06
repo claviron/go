@@ -14,35 +14,41 @@ import (
 
 var ErrClosed = errors.New("orbit-go: application is closed")
 
-// Options declares application identity and native resource budgets. All fields
-// are required; the library invents no timeout, retry policy or worker count.
-// The body limits apply to this first, buffered HTTP adapter.
+// Options declares application identity and native resource budgets. Identity,
+// NativeThreads, MaxExchanges and IOBufferBytes are required. The library invents
+// no timeout, retry policy or worker count.
+// IOBufferBytes bounds each pending read/write. Zero total body limits disable
+// that limit; they do not change the bounded stream window or operation size.
 type Options struct {
 	Fleet, Name                                     string
 	Incarnation                                     uint64
 	NativeThreads                                   uint32
 	MaxExchanges, MaxRequestBytes, MaxResponseBytes uint64
+	IOBufferBytes                                   uint64
 }
 
 type exchangeState struct {
 	cancel                  context.CancelFunc
 	handlerDone, nativeDone bool
+	io                      int
+	readDone, outputDone    chan struct{}
 }
 
 // Application is one application Link membership, not an HTTP server or runner.
 // One native completion waiter and NativeThreads native I/O threads serve it.
 // User handlers run on Go goroutines and never on the native I/O owner.
 type Application struct {
-	mu       sync.Mutex
-	handle   native.Handle
-	options  Options
-	handler  http.Handler
-	lane     uint64
-	active   map[native.Handle]*exchangeState
-	workers  sync.WaitGroup
-	done     chan struct{}
-	err      error
-	terminal bool
+	mu        sync.Mutex
+	handle    native.Handle
+	options   Options
+	handler   http.Handler
+	lane      uint64
+	active    map[native.Handle]*exchangeState
+	workers   sync.WaitGroup
+	ioWorkers sync.WaitGroup
+	done      chan struct{}
+	err       error
+	terminal  bool
 }
 
 // Open joins the Link and begins serving the supplied handler. It opens no
@@ -50,10 +56,10 @@ type Application struct {
 // Dispatch may begin before Open returns; handler state must already be ready.
 func Open(options Options, handler http.Handler) (*Application, error) {
 	maxInt := uint64(int(^uint(0) >> 1))
-	if handler == nil || options.Fleet == "" || options.Name == "" || options.Incarnation == 0 || options.NativeThreads == 0 || options.MaxExchanges == 0 || options.MaxRequestBytes == 0 || options.MaxResponseBytes == 0 || options.MaxRequestBytes >= maxInt || options.MaxResponseBytes > maxInt {
+	if handler == nil || options.Fleet == "" || options.Name == "" || options.Incarnation == 0 || options.NativeThreads == 0 || options.MaxExchanges == 0 || options.IOBufferBytes == 0 || options.IOBufferBytes > maxInt || options.MaxRequestBytes > maxInt || options.MaxResponseBytes > maxInt {
 		return nil, fmt.Errorf("orbit-go: a handler, identity and positive resource budgets are required")
 	}
-	handle, lane, err := native.Open(native.Options{Fleet: options.Fleet, Name: options.Name, Incarnation: options.Incarnation, NativeThreads: options.NativeThreads, MaxExchanges: options.MaxExchanges, MaxRequestBytes: options.MaxRequestBytes, MaxResponseBytes: options.MaxResponseBytes})
+	handle, lane, err := native.Open(native.Options{Fleet: options.Fleet, Name: options.Name, Incarnation: options.Incarnation, NativeThreads: options.NativeThreads, MaxExchanges: options.MaxExchanges, MaxRequestBytes: options.MaxRequestBytes, MaxResponseBytes: options.MaxResponseBytes, IOBufferBytes: options.IOBufferBytes})
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +135,7 @@ func (a *Application) complete(id native.Handle, handler bool) {
 	} else {
 		state.nativeDone = true
 	}
-	if state.handlerDone && state.nativeDone {
+	if state.handlerDone && state.nativeDone && state.io == 0 {
 		a.setError(native.ReleaseExchange(a.handle, id))
 		delete(a.active, id)
 	}
@@ -149,7 +155,7 @@ func (a *Application) pump() {
 			request, err := native.ReadRequest(event.Exchange)
 			ctx, cancel := context.WithCancel(context.Background())
 			a.mu.Lock()
-			a.active[event.Exchange] = &exchangeState{cancel: cancel}
+			a.active[event.Exchange] = &exchangeState{cancel: cancel, readDone: make(chan struct{}, 1), outputDone: make(chan struct{}, 1)}
 			a.workers.Add(1)
 			a.mu.Unlock()
 			go a.dispatch(event.Exchange, request, ctx, err)
@@ -179,11 +185,31 @@ func (a *Application) pump() {
 			}
 			a.mu.Unlock()
 			a.workers.Wait()
+			a.ioWorkers.Wait()
 			a.mu.Lock()
 			a.setError(native.Release(a.handle))
 			a.mu.Unlock()
 			close(a.done)
 			return
+		case 5, 6:
+			a.mu.Lock()
+			state := a.active[event.Exchange]
+			if state != nil {
+				ready := state.outputDone
+				if event.Kind == 5 {
+					ready = state.readDone
+				}
+				select {
+				case ready <- struct{}{}:
+				default:
+					a.setError(fmt.Errorf("orbit-go: duplicate I/O completion"))
+					_ = native.Cancel(a.handle)
+				}
+			} else {
+				a.setError(fmt.Errorf("orbit-go: completion without owner"))
+				_ = native.Cancel(a.handle)
+			}
+			a.mu.Unlock()
 		default:
 			a.mu.Lock()
 			a.setError(fmt.Errorf("orbit-go: invalid completion kind %d", event.Kind))
@@ -206,4 +232,46 @@ func (a *Application) UnsupportedFrames() (uint64, error) {
 		return 0, ErrClosed
 	}
 	return native.Unsupported(a.handle)
+}
+
+// ioOperation pins the exchange until its delivered result has been consumed.
+// Blocking here parks a Go goroutine, never a native thread per request.
+func (a *Application) ioOperation(id native.Handle, read bool, submit func() error, result func() (int, error)) (int, error) {
+	a.mu.Lock()
+	state := a.active[id]
+	if a.terminal || state == nil || state.nativeDone || state.handlerDone {
+		a.mu.Unlock()
+		return 0, ErrClosed
+	}
+	state.io++
+	a.ioWorkers.Add(1)
+	ready := state.outputDone
+	if read {
+		ready = state.readDone
+	}
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		state.io--
+		if state.io == 0 && state.nativeDone && state.handlerDone {
+			a.setError(native.ReleaseExchange(a.handle, id))
+			delete(a.active, id)
+		}
+		a.mu.Unlock()
+		a.ioWorkers.Done()
+	}()
+	if err := submit(); err != nil {
+		return 0, err
+	}
+	<-ready
+	return result()
+}
+
+func (a *Application) closeRead(id native.Handle) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.active[id] == nil || a.terminal {
+		return nil
+	}
+	return native.CloseRead(id)
 }

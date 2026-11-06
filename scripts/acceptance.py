@@ -21,8 +21,10 @@ if args.claviron_source:
     command += ['--claviron-source', str(args.claviron_source.resolve())]
 command += ['--', 'build', '-race', '-o', str(fixture), './harness/goapp']
 subprocess.run(command, cwd=root, check=True)
+example = target / 'plain-example'
+subprocess.run(command[:-2] + [str(example), './examples/plain'], cwd=root, check=True)
 fleet = 'g' + secrets.token_hex(4)[:7]
-result = subprocess.run([str(target / 'debug/orbit-go-acceptance'), str(fixture), fleet], cwd=root)
+result = subprocess.run([str(target / 'debug/orbit-go-acceptance'), str(fixture), fleet, str(example)], cwd=root)
 if result.returncode:
     print(f'Acceptance failed: retain fleet {fleet} for inspection; stop all owners before cleanup.', file=sys.stderr)
     sys.exit(result.returncode)

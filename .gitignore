@@ -6,3 +6,4 @@
 /.hosts
 /.cargo/config.toml
 /Cargo.lock
+__pycache__/
