@@ -1,0 +1,10 @@
+[package]
+name = "orbit-go-acceptance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+claviron.workspace = true
+tokio = { workspace = true, features = ["process", "io-std"] }

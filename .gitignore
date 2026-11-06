@@ -4,3 +4,5 @@
 /target/
 /prebuilds/
 /.hosts
+/.cargo/config.toml
+/Cargo.lock
