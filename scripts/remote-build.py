@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def release_module(root):
-    spec = importlib.util.spec_from_file_location("orbit_go_release", root / "scripts/release.py")
+    spec = importlib.util.spec_from_file_location("claviron_go_release", root / "scripts/release.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -168,7 +168,7 @@ def worker(job):
 
 
 def launch(request):
-    cache = Path(request.get("cache", Path.home() / ".cache/orbit-go-builder"))
+    cache = Path(request.get("cache", Path.home() / ".cache/claviron-go-builder"))
     (cache / "jobs").mkdir(parents=True, exist_ok=True)
     job = Path(tempfile.mkdtemp(prefix=request["revision"][:8] + "-" + request["target"] + "-", dir=cache / "jobs"))
     source = job / "source"

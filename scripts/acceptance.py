@@ -29,7 +29,7 @@ invoke_example = target / 'invoke-example'
 subprocess.run(command[:-2] + [str(invoke_example), './examples/invoke'], cwd=root, check=True)
 invoke_fleet = 'i' + secrets.token_hex(4)[:7]
 fleet = 'g' + secrets.token_hex(4)[:7]
-result = subprocess.run([str(target / 'debug/orbit-go-acceptance'), str(fixture), fleet, str(example), str(invoke_fixture), invoke_fleet, str(invoke_example)], cwd=root)
+result = subprocess.run([str(target / 'debug/claviron-go-acceptance'), str(fixture), fleet, str(example), str(invoke_fixture), invoke_fleet, str(invoke_example)], cwd=root)
 if result.returncode:
     print(f'Acceptance failed: retain fleets {fleet} and {invoke_fleet} for inspection; stop all owners before cleanup.', file=sys.stderr)
     sys.exit(result.returncode)

@@ -1,4 +1,4 @@
-package orbitgo
+package orbit
 
 import (
 	"context"
@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/claviron/orbit-go/internal/native"
+	"github.com/claviron/go/internal/native"
 )
 
 // InvokeCode preserves the core protocol's typed results. OutcomeUnknown never
@@ -88,7 +88,7 @@ type Invocations struct {
 func (a *Application) OpenInvocations(o InvokeOptions, handler InvokeHandler) (*Invocations, error) {
 	maxInt := uint64(int(^uint(0) >> 1))
 	if handler == nil || o.Fleet == "" || o.Service == "" || o.PendingCalls == 0 || o.AcceptedCalls == 0 || o.OperationBytes == 0 || o.PendingCalls > maxInt || o.AcceptedCalls > maxInt || o.RequestBytes > maxInt || o.ResponseBytes > maxInt {
-		return nil, fmt.Errorf("orbit-go: invoke identity, handler and positive capacities are required")
+		return nil, fmt.Errorf("orbit: invoke identity, handler and positive capacities are required")
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -120,7 +120,7 @@ func (i *Invocations) setError(err error) {
 // whereas remote/protocol outcomes are preserved in InvokeResult.Code.
 func (i *Invocations) Call(ctx context.Context, target, operation string, payload []byte) (InvokeResult, error) {
 	if ctx == nil {
-		return InvokeResult{}, fmt.Errorf("orbit-go: nil invoke context")
+		return InvokeResult{}, fmt.Errorf("orbit: nil invoke context")
 	}
 	if err := ctx.Err(); err != nil {
 		return InvokeResult{}, err
@@ -134,7 +134,7 @@ func (i *Invocations) Call(ctx context.Context, target, operation string, payloa
 	if owner, ok := ctx.Value(generationContextKey{}).(generationOwner); ok {
 		if owner.application != i.application {
 			i.mu.Unlock()
-			return InvokeResult{}, fmt.Errorf("orbit-go: invoke context belongs to another application")
+			return InvokeResult{}, fmt.Errorf("orbit: invoke context belongs to another application")
 		}
 		expected = owner.generation
 	}
@@ -179,7 +179,7 @@ func invokeError(err error) error {
 // nested outbound calls), then drains the core driver. ctx limits only waiting.
 func (i *Invocations) Shutdown(ctx context.Context) error {
 	if ctx == nil {
-		return fmt.Errorf("orbit-go: nil invoke shutdown context")
+		return fmt.Errorf("orbit: nil invoke shutdown context")
 	}
 	i.beginShutdown(false)
 	select {
@@ -294,7 +294,7 @@ func (i *Invocations) pump() {
 			if call := i.calls[event.Exchange]; call != nil {
 				close(call.ready)
 			} else {
-				i.setError(fmt.Errorf("orbit-go: invoke result without owner"))
+				i.setError(fmt.Errorf("orbit: invoke result without owner"))
 			}
 			i.mu.Unlock()
 		case 6:

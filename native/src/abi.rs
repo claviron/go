@@ -179,7 +179,7 @@ pub(crate) unsafe fn copy_out(
 }
 
 /// # Safety
-/// All pointers obey internal/native/orbit_go.h: aligned outputs, call-scoped
+/// All pointers obey internal/native/claviron_go.h: aligned outputs, call-scoped
 /// readable inputs and exclusive writable copy-out buffers. No input is retained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {

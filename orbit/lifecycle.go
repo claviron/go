@@ -1,8 +1,8 @@
-package orbitgo
+package orbit
 
 import (
 	"context"
-	"github.com/claviron/orbit-go/internal/native"
+	"github.com/claviron/go/internal/native"
 )
 
 // A handler context carries its native owner as well as its generation. This

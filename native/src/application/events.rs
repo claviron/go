@@ -18,7 +18,7 @@ use crate::abi::{Result, Status};
 
 // This protocol topic identifies lifecycle decisions among Go instances. It is
 // not an operator setting: changing it creates a different event protocol.
-const TOPIC: &str = "orbit-go.lifecycle.v1";
+const TOPIC: &str = "claviron-go.lifecycle.v1";
 
 pub struct Events {
     bus: Arc<FleetEventBus<ApplicationEventLayout>>,

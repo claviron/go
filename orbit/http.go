@@ -1,4 +1,4 @@
-package orbitgo
+package orbit
 
 import (
 	"context"
@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/claviron/orbit-go/internal/httpadapter"
-	"github.com/claviron/orbit-go/internal/native"
+	"github.com/claviron/go/internal/httpadapter"
+	"github.com/claviron/go/internal/native"
 )
 
 // Header retains the ordered, original Link header name and value.

@@ -1,4 +1,4 @@
-# orbit-go
+# claviron/go
 
 A Go library for handling Claviron application requests over same-host Orbit
 Link. Your normal Go executable imports the library and supplies a standard
@@ -27,11 +27,11 @@ manifest.
 Requires Go 1.23 or later with cgo and a C compiler.
 
 ```sh
-go get github.com/claviron/orbit-go@latest
+go get github.com/claviron/go/orbit@latest
 ```
 
 cgo links a native library that `go get` does not fetch. Each
-[GitHub release](https://github.com/claviron/orbit-go/releases) carries one for
+[GitHub release](https://github.com/claviron/go/releases) carries one for
 Linux and FreeBSD on x86-64 and arm64, and macOS on arm64. Download the one for
 your platform and version, and build with it:
 
@@ -56,11 +56,11 @@ import (
     "os"
     "os/signal"
 
-    orbitgo "github.com/claviron/orbit-go"
+    "github.com/claviron/go/orbit"
 )
 
 func main() {
-    app, err := orbitgo.Open(orbitgo.Options{
+    app, err := orbit.Open(orbit.Options{
         Fleet: "example", Name: "hello", Incarnation: 1,
         NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096,
         MaxRequestBytes: 0, MaxResponseBytes: 0,
@@ -199,19 +199,19 @@ runtime or framework dependency. HTTP uses `http.Handler`; invoke uses its own
 `InvokeHandler` and opaque operation/payload values.
 
 ```go
-calls, err := app.OpenInvocations(orbitgo.InvokeOptions{
+calls, err := app.OpenInvocations(orbit.InvokeOptions{
     Fleet: "ex-rpc", Service: "go-service",
     PendingCalls: 32, AcceptedCalls: 32,
     OperationBytes: 64, RequestBytes: 4096, ResponseBytes: 65536,
     Routes: map[string]string{"peer": "peer-service"},
-}, func(ctx context.Context, request orbitgo.Invocation) orbitgo.InvokeResult {
+}, func(ctx context.Context, request orbit.Invocation) orbit.InvokeResult {
     if ctx.Err() != nil {
-        return orbitgo.InvokeResult{Code: orbitgo.InvokeRemoteClosing}
+        return orbit.InvokeResult{Code: orbit.InvokeRemoteClosing}
     }
     if request.Operation != "echo" {
-        return orbitgo.InvokeResult{Code: orbitgo.InvokeUnsupported}
+        return orbit.InvokeResult{Code: orbit.InvokeUnsupported}
     }
-    return orbitgo.InvokeResult{Payload: request.Payload}
+    return orbit.InvokeResult{Payload: request.Payload}
 })
 if err != nil { panic(err) }
 
@@ -221,7 +221,7 @@ ctx, err := app.GenerationContext()
 if err != nil { panic(err) }
 result, err := calls.Call(ctx, "peer", "echo", []byte("hello"))
 if err != nil { /* local cancellation, capacity or binding failure */ }
-if err == nil && result.Code == orbitgo.InvokeSuccess {
+if err == nil && result.Code == orbit.InvokeSuccess {
     _ = result.Payload
 }
 ```
@@ -284,4 +284,4 @@ payload length. The canonical C header lives in the cgo package so Go's build
 cache tracks header changes as well as Go source changes.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) and
-[the ABI header](internal/native/orbit_go.h) for ownership contracts.
+[the ABI header](internal/native/claviron_go.h) for ownership contracts.

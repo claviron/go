@@ -1,6 +1,6 @@
-// Package orbitgo connects a Go application's handlers to Claviron over Orbit Link.
+// Package orbit connects a Go application's handlers to Claviron over Orbit Link.
 // The application owns main, its Go runtime and its process lifecycle.
-package orbitgo
+package orbit
 
 import (
 	"context"
@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/claviron/orbit-go/internal/native"
+	"github.com/claviron/go/internal/native"
 )
 
-var ErrClosed = errors.New("orbit-go: application is closed")
+var ErrClosed = errors.New("orbit: application is closed")
 
 // Options declares application identity and native resource budgets. Identity,
 // NativeThreads, MaxExchanges and IOBufferBytes are required. The library invents
@@ -63,7 +63,7 @@ type Application struct {
 func Open(options Options, handler http.Handler) (*Application, error) {
 	maxInt := uint64(int(^uint(0) >> 1))
 	if handler == nil || options.Fleet == "" || options.Name == "" || options.Incarnation == 0 || options.NativeThreads == 0 || options.MaxExchanges == 0 || options.IOBufferBytes == 0 || options.IOBufferBytes > maxInt || options.MaxRequestBytes > maxInt || options.MaxResponseBytes > maxInt {
-		return nil, fmt.Errorf("orbit-go: a handler, identity and positive resource budgets are required")
+		return nil, fmt.Errorf("orbit: a handler, identity and positive resource budgets are required")
 	}
 	handle, lane, err := native.Open(native.Options{Fleet: options.Fleet, Name: options.Name, Incarnation: options.Incarnation, NativeThreads: options.NativeThreads, MaxExchanges: options.MaxExchanges, MaxRequestBytes: options.MaxRequestBytes, MaxResponseBytes: options.MaxResponseBytes, IOBufferBytes: options.IOBufferBytes})
 	if err != nil {
@@ -92,7 +92,7 @@ func (a *Application) Err() error { a.mu.Lock(); defer a.mu.Unlock(); return a.e
 // Expiring ctx ends only this wait; call Close explicitly to cancel owned work.
 func (a *Application) Shutdown(ctx context.Context) error {
 	if ctx == nil {
-		return fmt.Errorf("orbit-go: nil shutdown context")
+		return fmt.Errorf("orbit: nil shutdown context")
 	}
 	a.mu.Lock()
 	a.shutting = true
@@ -253,17 +253,17 @@ func (a *Application) pump() {
 				select {
 				case ready <- struct{}{}:
 				default:
-					a.setError(fmt.Errorf("orbit-go: duplicate I/O completion"))
+					a.setError(fmt.Errorf("orbit: duplicate I/O completion"))
 					_ = native.Cancel(a.handle)
 				}
 			} else {
-				a.setError(fmt.Errorf("orbit-go: completion without owner"))
+				a.setError(fmt.Errorf("orbit: completion without owner"))
 				_ = native.Cancel(a.handle)
 			}
 			a.mu.Unlock()
 		default:
 			a.mu.Lock()
-			a.setError(fmt.Errorf("orbit-go: invalid completion kind %d", event.Kind))
+			a.setError(fmt.Errorf("orbit: invalid completion kind %d", event.Kind))
 			_ = native.Cancel(a.handle)
 			a.mu.Unlock()
 		}

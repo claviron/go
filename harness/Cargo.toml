@@ -1,5 +1,5 @@
 [package]
-name = "orbit-go-acceptance"
+name = "claviron-go-acceptance"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true

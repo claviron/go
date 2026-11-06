@@ -16,11 +16,11 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 # Classifier: Rust triple, library, target CPU, ELF machine, accepted ELF OS ABIs.
 TARGETS = {
-    "linux-x86_64": ("x86_64-unknown-linux-gnu", "liborbit_go.so", "x86-64", 62, (0, 3)),
-    "linux-aarch64": ("aarch64-unknown-linux-gnu", "liborbit_go.so", "generic", 183, (0, 3)),
-    "macos-aarch64": ("aarch64-apple-darwin", "liborbit_go.dylib", "generic", None, ()),
-    "freebsd-x86_64": ("x86_64-unknown-freebsd", "liborbit_go.so", "x86-64", 62, (9,)),
-    "freebsd-aarch64": ("aarch64-unknown-freebsd", "liborbit_go.so", "generic", 183, (9,)),
+    "linux-x86_64": ("x86_64-unknown-linux-gnu", "libclaviron_go.so", "x86-64", 62, (0, 3)),
+    "linux-aarch64": ("aarch64-unknown-linux-gnu", "libclaviron_go.so", "generic", 183, (0, 3)),
+    "macos-aarch64": ("aarch64-apple-darwin", "libclaviron_go.dylib", "generic", None, ()),
+    "freebsd-x86_64": ("x86_64-unknown-freebsd", "libclaviron_go.so", "x86-64", 62, (9,)),
+    "freebsd-aarch64": ("aarch64-unknown-freebsd", "libclaviron_go.so", "generic", 183, (9,)),
 }
 TARGET_ALIASES = {
     "linux-x64-gnu": "linux-x86_64",
@@ -98,7 +98,7 @@ def ensure_lock(root=ROOT):
     """Resolve once, outside the checkout so a parent's Cargo patches cannot reach it."""
     lock = root / "prebuilds/Cargo.lock"
     if not lock.is_file():
-        with tempfile.TemporaryDirectory(prefix="orbit-go-resolve-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="claviron-go-resolve-") as temporary:
             source = Path(temporary).resolve()
             copy_sources(root, source)
             run(["cargo", "generate-lockfile"], cwd=source)
@@ -157,7 +157,7 @@ def prepare(root=ROOT, target=None):
     lock = ensure_lock(root)
     lock_hash = file_sha(lock)
     # Stage outside the checkout so parent .cargo/config.toml cannot inject local patches.
-    with tempfile.TemporaryDirectory(prefix="orbit-go-native-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="claviron-go-native-") as temporary:
         source = Path(temporary).resolve()
         copy_sources(root, source)
         shutil.copyfile(lock, source / "Cargo.lock")
@@ -177,7 +177,7 @@ def prepare(root=ROOT, target=None):
         metadata = subprocess.check_output(["cargo", "metadata", "--locked", "--all-features", "--format-version", "1"],
                                            cwd=source, env=env, text=True)
         validate_local_dependencies(json.loads(metadata), source)
-        run(["cargo", "build", "--package", "orbit-go-native", "--locked", "--release", "--target", triple],
+        run(["cargo", "build", "--package", "claviron-go-native", "--locked", "--release", "--target", triple],
             cwd=source, env=env)
         data = (output / triple / "release" / library).read_bytes()
     if expected != context(root) or lock_hash != file_sha(lock):

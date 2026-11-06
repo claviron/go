@@ -1,4 +1,4 @@
-package orbitgo
+package orbit
 
 import (
 	"io"
@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/claviron/orbit-go/internal/native"
+	"github.com/claviron/go/internal/native"
 )
 
 // inputBody serializes reads but Close never waits behind a blocked Read.

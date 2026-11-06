@@ -1,4 +1,4 @@
-// A normal Go application using orbit-go. The caller owns its process lifecycle.
+// A normal Go application using claviron-go. The caller owns its process lifecycle.
 package main
 
 import (
@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"syscall"
 
-	orbitgo "github.com/claviron/orbit-go"
+	"github.com/claviron/go/orbit"
 )
 
 func main() {
@@ -28,10 +28,10 @@ func main() {
 	defer stop()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /generation", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, orbitgo.Generation(r))
+		fmt.Fprint(w, orbit.Generation(r))
 	})
 	mux.HandleFunc("GET /wait-generation", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Generation", strconv.FormatUint(orbitgo.Generation(r), 10))
+		w.Header().Set("X-Generation", strconv.FormatUint(orbit.Generation(r), 10))
 		if err := http.NewResponseController(w).Flush(); err != nil {
 			return
 		}
@@ -66,7 +66,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "Hello from Go")
 	})
-	app, err := orbitgo.Open(orbitgo.Options{Fleet: *fleet, Name: *name, Incarnation: 1,
+	app, err := orbit.Open(orbit.Options{Fleet: *fleet, Name: *name, Incarnation: 1,
 		NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: *buffer,
 		MaxRequestBytes: *maxRequest, MaxResponseBytes: *maxResponse}, mux)
 	if err != nil {

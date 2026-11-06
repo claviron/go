@@ -495,7 +495,7 @@ async fn example_streaming(
 async fn main() -> Result<()> {
     let binary = std::env::args_os()
         .nth(1)
-        .ok_or("usage: orbit-go-acceptance <Go fixture binary>")?
+        .ok_or("usage: claviron-go-acceptance <Go fixture binary>")?
         .into();
     let fleet =
         std::env::args().nth(2).ok_or("an isolated fleet name is required")?;

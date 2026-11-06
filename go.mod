@@ -1,3 +1,3 @@
-module github.com/claviron/orbit-go
+module github.com/claviron/go
 
 go 1.23.0

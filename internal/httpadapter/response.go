@@ -9,9 +9,9 @@ import (
 	"sync"
 )
 
-var ErrResponseClosed = errors.New("orbit-go: response writer is closed")
-var ErrResponseTooLarge = errors.New("orbit-go: response exceeds MaxResponseBytes")
-var ErrUnsupportedResponse = errors.New("orbit-go: informational responses and trailers are not supported")
+var ErrResponseClosed = errors.New("orbit: response writer is closed")
+var ErrResponseTooLarge = errors.New("orbit: response exceeds MaxResponseBytes")
+var ErrUnsupportedResponse = errors.New("orbit: informational responses and trailers are not supported")
 
 // Sink acknowledges transport operations after the bounded native writer accepts
 // them. Finish sends FIN; Abort resets an already committed response.
@@ -52,11 +52,11 @@ func (w *ResponseWriter) commit(status int) error {
 	}
 	if values := w.header.Values("Content-Length"); len(values) > 0 {
 		if len(values) != 1 {
-			return fmt.Errorf("orbit-go: multiple Content-Length values")
+			return fmt.Errorf("orbit: multiple Content-Length values")
 		}
 		n, err := strconv.ParseInt(values[0], 10, 64)
 		if err != nil || n < 0 {
-			return fmt.Errorf("orbit-go: invalid Content-Length")
+			return fmt.Errorf("orbit: invalid Content-Length")
 		}
 		w.length = n
 	}

@@ -11,19 +11,19 @@ import (
 	"sync"
 	"sync/atomic"
 
-	orbitgo "github.com/claviron/orbit-go"
+	"github.com/claviron/go/orbit"
 )
 
 func main() {
 	if len(os.Args) != 3 {
 		panic("usage: invokeapp <HTTP fleet> <invoke fleet>")
 	}
-	var endpoint atomic.Pointer[orbitgo.Invocations]
+	var endpoint atomic.Pointer[orbit.Invocations]
 	late := make(chan struct{})
 	drain := make(chan struct{})
 	httpGate := make(chan struct{})
 	var lateOnce, drainOnce, httpOnce sync.Once
-	app, err := orbitgo.Open(orbitgo.Options{Fleet: os.Args[1], Name: "app", Incarnation: 1, NativeThreads: 1, MaxExchanges: 8, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	app, err := orbit.Open(orbit.Options{Fleet: os.Args[1], Name: "app", Incarnation: 1, NativeThreads: 1, MaxExchanges: 8, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-PID", fmt.Sprint(os.Getpid()))
 		if r.URL.Path == "/hold-invoke" {
 			w.WriteHeader(200)
@@ -31,39 +31,39 @@ func main() {
 			fmt.Println("HTTP_HELD")
 			<-httpGate
 			result, err := endpoint.Load().Call(r.Context(), "rust", "echo", []byte("from-http"))
-			if err != nil || result.Code != orbitgo.InvokeSuccess {
+			if err != nil || result.Code != orbit.InvokeSuccess {
 				panic("HTTP nested invoke failed")
 			}
 			_, _ = w.Write(result.Payload)
 			return
 		}
-		fmt.Fprintf(w, "%d", orbitgo.Generation(r))
+		fmt.Fprintf(w, "%d", orbit.Generation(r))
 	}))
 	if err != nil {
 		panic(err)
 	}
 	// Failed attachment must return its native parent reservation and leave
 	// HTTP usable. Opening the valid endpoint below must not mask a leaked pin.
-	if _, err := app.OpenInvocations(orbitgo.InvokeOptions{Fleet: os.Args[1], Service: "invalid", PendingCalls: 1, AcceptedCalls: 1, OperationBytes: 1}, func(context.Context, orbitgo.Invocation) orbitgo.InvokeResult { return orbitgo.InvokeResult{} }); err == nil {
+	if _, err := app.OpenInvocations(orbit.InvokeOptions{Fleet: os.Args[1], Service: "invalid", PendingCalls: 1, AcceptedCalls: 1, OperationBytes: 1}, func(context.Context, orbit.Invocation) orbit.InvokeResult { return orbit.InvokeResult{} }); err == nil {
 		panic("HTTP and invoke fleets were not isolated")
 	}
-	client, err := app.OpenInvocations(orbitgo.InvokeOptions{Fleet: os.Args[2], Service: "go-calls", PendingCalls: 2, AcceptedCalls: 2, OperationBytes: 64, RequestBytes: 1024, ResponseBytes: 1024, Routes: map[string]string{"rust": "rust-peer"}}, func(ctx context.Context, request orbitgo.Invocation) orbitgo.InvokeResult {
+	client, err := app.OpenInvocations(orbit.InvokeOptions{Fleet: os.Args[2], Service: "go-calls", PendingCalls: 2, AcceptedCalls: 2, OperationBytes: 64, RequestBytes: 1024, ResponseBytes: 1024, Routes: map[string]string{"rust": "rust-peer"}}, func(ctx context.Context, request orbit.Invocation) orbit.InvokeResult {
 		switch request.Operation {
 		case "echo":
-			return orbitgo.InvokeResult{Payload: request.Payload}
+			return orbit.InvokeResult{Payload: request.Payload}
 		case "generation":
-			return orbitgo.InvokeResult{Payload: []byte(fmt.Sprint(request.Generation))}
+			return orbit.InvokeResult{Payload: []byte(fmt.Sprint(request.Generation))}
 		case "reject":
-			return orbitgo.InvokeResult{Code: orbitgo.InvokeRejected, Payload: request.Payload}
+			return orbit.InvokeResult{Code: orbit.InvokeRejected, Payload: request.Payload}
 		case "oversize":
-			return orbitgo.InvokeResult{Payload: make([]byte, 1025)}
+			return orbit.InvokeResult{Payload: make([]byte, 1025)}
 		case "panic":
 			panic("handler fixture")
 		case "cancel-close":
 			fmt.Println("CLOSE_HELD")
 			<-ctx.Done()
 			fmt.Println("CLOSE_CANCELLED")
-			return orbitgo.InvokeResult{Code: orbitgo.InvokeRemoteClosing}
+			return orbit.InvokeResult{Code: orbit.InvokeRemoteClosing}
 		case "hold":
 			fmt.Printf("INCOMING %d\n", request.Generation)
 			<-ctx.Done()
@@ -73,17 +73,17 @@ func main() {
 				panic("retired context entered a new native generation")
 			}
 			fmt.Printf("LATE_RETURN %d\n", request.Generation)
-			return orbitgo.InvokeResult{Payload: []byte("retired")}
+			return orbit.InvokeResult{Payload: []byte("retired")}
 		case "drain":
 			fmt.Println("DRAIN_HELD")
 			<-drain
 			result, err := endpoint.Load().Call(ctx, "rust", "echo", request.Payload)
-			if err != nil || result.Code != orbitgo.InvokeSuccess {
+			if err != nil || result.Code != orbit.InvokeSuccess {
 				panic(fmt.Sprintf("nested invoke: %v / %v", result, err))
 			}
 			return result
 		default:
-			return orbitgo.InvokeResult{Code: orbitgo.InvokeUnsupported}
+			return orbit.InvokeResult{Code: orbit.InvokeUnsupported}
 		}
 	})
 	if err != nil {
@@ -109,7 +109,7 @@ func main() {
 		case "capacity-call":
 			go func() {
 				result, err := client.Call(context.Background(), "rust", "hold", nil)
-				if err != nil || result.Code != orbitgo.InvokeSuccess {
+				if err != nil || result.Code != orbit.InvokeSuccess {
 					panic("capacity call failed")
 				}
 				fmt.Println("CAPACITY_DONE")

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	orbitgo "github.com/claviron/orbit-go"
+	"github.com/claviron/go/orbit"
 )
 
 func main() {
@@ -32,22 +32,22 @@ func main() {
 	if len(os.Args) > 3 && os.Args[3] == "stream" {
 		limit = 0
 	}
-	var owner atomic.Pointer[orbitgo.Application]
-	app, err := orbitgo.Open(orbitgo.Options{Fleet: os.Args[1], Name: os.Args[2], Incarnation: 1,
+	var owner atomic.Pointer[orbit.Application]
+	app, err := orbit.Open(orbit.Options{Fleet: os.Args[1], Name: os.Args[2], Incarnation: 1,
 		NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096, MaxRequestBytes: limit, MaxResponseBytes: limit},
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/generation":
-				fmt.Fprint(w, orbitgo.Generation(r))
+				fmt.Fprint(w, orbit.Generation(r))
 				return
 			case "/late":
-				generation := orbitgo.Generation(r)
+				generation := orbit.Generation(r)
 				fmt.Printf("LATE %d\n", generation)
 				<-lateGate
 				if _, err := w.Write([]byte("late")); err == nil {
 					panic("retired handler published a response")
 				}
-				fmt.Printf("LATE_REJECTED %d\n", orbitgo.Generation(r))
+				fmt.Printf("LATE_REJECTED %d\n", orbit.Generation(r))
 				return
 			case "/consume":
 				if _, err := io.Copy(io.Discard, r.Body); err != nil {
@@ -148,7 +148,7 @@ func main() {
 				if r.Context().Value(http.LocalAddrContextKey) == nil {
 					panic("local address lost")
 				}
-				raw := orbitgo.RawHeaders(r)
+				raw := orbit.RawHeaders(r)
 				if len(raw) != 3 || raw[1].Name != "x-Test" || raw[2].Value != "second" {
 					panic("raw headers lost")
 				}
@@ -160,7 +160,7 @@ func main() {
 				w.Header().Add("Set-Cookie", "a=1")
 				w.Header().Add("Set-Cookie", "b=2")
 				w.WriteHeader(201)
-				fmt.Fprintf(w, "%s|%s|%s|%s|%s|%s", r.Method, r.RequestURI, r.Host, orbitgo.Scheme(r), r.Header.Values("X-Test"), body)
+				fmt.Fprintf(w, "%s|%s|%s|%s|%s|%s", r.Method, r.RequestURI, r.Host, orbit.Scheme(r), r.Header.Values("X-Test"), body)
 				return
 			}
 			if r.Method == http.MethodHead {

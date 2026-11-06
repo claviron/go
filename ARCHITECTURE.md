@@ -2,7 +2,7 @@
 
 ## Ownership boundary
 
-orbit-go is imported by a normal Go application. The caller supplies an
+claviron-go is imported by a normal Go application. The caller supplies an
 `http.Handler`, application identity and explicit resource budgets. The library
 owns one application Link membership. The caller owns `main`, signals, process
 lifetime and handler code.
@@ -23,7 +23,7 @@ in Go. The separate direct-integration Go FFI project is not a dependency.
 - `body.go`: lazy, serialized reads and concurrent input closure.
 - `internal/native/native.go`: private cgo calls and copy-out metadata.
 - `internal/httpadapter/response.go`: streaming response ownership and net/http behavior.
-- `internal/native/orbit_go.h`: ABI version four and ownership rules.
+- `internal/native/claviron_go.h`: ABI version four and ownership rules.
 - `native/src/abi.rs`: checked downcalls and unwind containment.
 - `native/src/registry.rs`: never-reused, kind-checked application/exchange handles.
 - `native/src/application.rs`: Link membership, frame dispatch and application drain.

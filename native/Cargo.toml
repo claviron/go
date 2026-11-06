@@ -1,5 +1,5 @@
 [package]
-name = "orbit-go-native"
+name = "claviron-go-native"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ publish.workspace = true
 autotests = false
 
 [lib]
-name = "orbit_go"
+name = "claviron_go"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

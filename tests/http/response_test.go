@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	adapter "github.com/claviron/orbit-go/internal/httpadapter"
+	adapter "github.com/claviron/go/internal/httpadapter"
 )
 
 type sink struct {

@@ -1,7 +1,7 @@
 package native
 
 /*
-#include "orbit_go.h"
+#include "claviron_go.h"
 */
 import "C"
 
@@ -31,7 +31,7 @@ func InvokeOpen(app Handle, o InvokeOptions) (Handle, error) {
 		return 0, err
 	}
 	if abi.version != 4 || unsafe.Sizeof(C.og_invoke_options{}) != 40 || unsafe.Sizeof(C.og_invoke_info{}) != 16 {
-		return 0, fmt.Errorf("orbit-go: incompatible invoke ABI")
+		return 0, fmt.Errorf("orbit: incompatible invoke ABI")
 	}
 	var routes []byte
 	keys := make([]string, 0, len(o.Routes))

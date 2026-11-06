@@ -2,8 +2,8 @@
 package native
 
 /*
-#cgo LDFLAGS: -lorbit_go
-#include "orbit_go.h"
+#cgo LDFLAGS: -lclaviron_go
+#include "claviron_go.h"
 */
 import "C"
 
@@ -19,9 +19,9 @@ type Status uint32
 func (s Status) Error() string {
 	names := [...]string{"ok", "invalid argument", "invalid handle", "closed", "capacity exhausted", "unsupported operation", "transport failure", "native panic", "busy", "cancelled", "body limit exceeded"}
 	if int(s) < len(names) {
-		return "orbit-go: " + names[s]
+		return "orbit: " + names[s]
 	}
-	return fmt.Sprintf("orbit-go: native status %d", s)
+	return fmt.Sprintf("orbit: native status %d", s)
 }
 func check(s C.uint32_t) error {
 	if s != 0 {
@@ -63,7 +63,7 @@ func Open(o Options) (Handle, uint64, error) {
 		return 0, 0, err
 	}
 	if abi.version != 4 || uintptr(abi.event_size) != unsafe.Sizeof(C.og_event{}) || uintptr(abi.options_size) != unsafe.Sizeof(C.og_options{}) || uintptr(abi.info_size) != unsafe.Sizeof(C.og_request_info_record{}) {
-		return 0, 0, fmt.Errorf("orbit-go: incompatible native ABI")
+		return 0, 0, fmt.Errorf("orbit: incompatible native ABI")
 	}
 	opts := C.og_options{abi_version: 4, native_threads: C.uint32_t(o.NativeThreads), incarnation: C.uint64_t(o.Incarnation), max_exchanges: C.uint64_t(o.MaxExchanges), max_request_bytes: C.uint64_t(o.MaxRequestBytes), max_response_bytes: C.uint64_t(o.MaxResponseBytes), io_buffer_bytes: C.uint64_t(o.IOBufferBytes)}
 	var handle, lane C.uint64_t

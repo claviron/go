@@ -50,7 +50,7 @@ fn routes(mut value: &[u8]) -> Result<Vec<(Box<str>, Box<str>)>> {
     Ok(result)
 }
 /// # Safety
-/// See orbit_go.h: aligned records, valid call-scoped inputs and writable outputs.
+/// See claviron_go.h: aligned records, valid call-scoped inputs and writable outputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn og_invoke_open(
     app: u64,
