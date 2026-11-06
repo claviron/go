@@ -171,6 +171,9 @@ def prepare(root=ROOT, target=None):
             f"\x1f--remap-path-prefix={Path.home()}=/build-home"
             f"\x1f--remap-path-prefix={cargo_home}=/cargo"
             f"\x1f--remap-path-prefix={Path(tempfile.gettempdir()).resolve()}=/build")
+        # Otherwise a dylib is named after its build directory, which only this machine has.
+        if triple.endswith("-apple-darwin"):
+            env["CARGO_ENCODED_RUSTFLAGS"] += f"\x1f-C\x1flink-arg=-Wl,-install_name,@rpath/{library}"
         metadata = subprocess.check_output(["cargo", "metadata", "--locked", "--all-features", "--format-version", "1"],
                                            cwd=source, env=env, text=True)
         validate_local_dependencies(json.loads(metadata), source)

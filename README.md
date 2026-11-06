@@ -19,9 +19,30 @@ Go process and native I/O runtime. Public event subscriptions remain a later sta
 frames outside the supported lifecycle/status contract are counted by
 `UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
-This is unreleased source. The intended module path is
-`github.com/claviron/orbit-go`; no public Go release is available. It uses the
-Link application API of the published Claviron named in its manifest.
+It uses the Link application API of the published Claviron named in its
+manifest.
+
+## Install
+
+Requires Go 1.23 or later with cgo and a C compiler.
+
+```sh
+go get github.com/claviron/orbit-go@latest
+```
+
+cgo links a native library that `go get` does not fetch. Each
+[GitHub release](https://github.com/claviron/orbit-go/releases) carries one for
+Linux and FreeBSD on x86-64 and arm64, and macOS on arm64. Download the one for
+your platform and version, and build with it:
+
+```sh
+CGO_LDFLAGS="-L/path/to/lib -Wl,-rpath,/path/to/lib" go build
+```
+
+Alternatively, make it available to the platform loader at run time.
+
+End-to-end validation covers Linux x86-64; the other platforms are built and
+checked but have not been run end to end.
 
 ## Use from a Go application
 
@@ -249,70 +270,18 @@ retaining old handlers for the application's lifetime.
 See [the complete invoke example](examples/invoke/main.go). Its `/invoke` HTTP
 route calls a peer service, while its invoke handler serves `echo` concurrently:
 
-```sh
-python3 scripts/build.py --claviron-source /path/to/claviron -- run ./examples/invoke \
-  --fleet example --invoke-fleet ex-rpc --service go-service --peer peer-service
-```
-
 The operator supplies the separate peer service. Invocations are a trusted
 same-host Link capability; domain authorization belongs in the handler.
 
 ## ABI migration
 
 ABI v4 adds separate invoke owners, retained call/handler handles and signalled
-completion delivery to v3 lifecycle/streaming operations. Rebuild the Go package and
-its matching native library together. Older bindings are rejected before joining;
+completion delivery to v3 lifecycle/streaming operations. Use the Go package and
+the native library of one version together. Older bindings are rejected before joining;
 the version-query record keeps its original extent so they can query safely. Go
 callers must now supply `IOBufferBytes`; zero total body limits mean unlimited
 payload length. The canonical C header lives in the cgo package so Go's build
 cache tracks header changes as well as Go source changes.
 
-## Build and validate
-
-Requirements: Go with cgo and a C compiler, Rust 1.98 or newer, Python 3 and a
-matching Claviron source checkout. The Go language baseline is 1.23; initial
-validation used Go 1.27.3 and Rust 1.99.1 on Linux x86-64. Other platforms have
-not been validated. The explicit acceptance driver also needs the `orbit` CLI
-for cleanup of its isolated HTTP and invoke test fleets.
-
-```sh
-python3 scripts/build.py --claviron-source /path/to/claviron -- test -race ./...
-python3 scripts/acceptance.py --claviron-source /path/to/claviron
-python3 scripts/build.py --claviron-source /path/to/claviron -- run ./examples/plain --fleet example --name hello
-```
-
-Use `--go /path/to/go` or `GO` to select the Go executable, and `--release` on
-build.py for a release native library. The script preserves PATH and sets the
-native library search path for the Go command. A local source override may also
-live in ignored Cargo configuration. No local paths belong in the manifest.
-For downstream builds, link the matching native library with `CGO_LDFLAGS` and
-make it available to the platform loader; automated native distribution follows
-in a later stage.
-
-`scripts/release.py --prepare` builds one portable native library for this host
-into the ignored `prebuilds/`. `scripts/build-all.sh` does so for every host in
-the ignored `.hosts`: each builds the current commit in an isolated clone,
-fetching it first when needed, and its library is collected and verified here.
-Nothing is published by either.
-
-The acceptance driver builds ordinary Go fixtures and the actual plain/invoke
-Go examples, then exchanges requests with Claviron's real ApplicationClient. It covers repeated headers, encoded URI,
-addresses, bounded bodies, HEAD, concurrent application instances, cancellation,
-handler panic before/after commit, failed reply publication and graceful drain.
-It fills the upload window and proves the next write is pending, transfers bodies
-larger than the stream window in both directions, cancels reads/writes, and
-sends SIGTERM to the actual Go example during a streaming response. Lifecycle
-acceptance verifies two-instance fan-out, wrong-target isolation, generation
-context cancellation, delayed old handlers, Go lifecycle APIs and unchanged
-process/lane ownership. The actual Go example is stopped, started and restarted
-through real Claviron control frames. Invoke acceptance verifies binary/rejected
-payloads, typed failures, bounded pending calls with concurrent HTTP progress,
-local cancellation without remote rollback, generation retirement and late
-results, nested calls during HTTP and invoke drain, explicit Close, and the
-shipped invoke example in both directions. Go programs run with the race
-detector; use `GOEXPERIMENT=cgocheck2` for strict cgo pointer checking. It stops
-its own processes before clearing its unique fleets and preserves failed fleets for
-inspection. No production listener or load benchmark is involved.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md), [the ABI header](internal/native/orbit_go.h)
-and [PLAN.md](PLAN.md) for ownership contracts and remaining stages.
+See [ARCHITECTURE.md](ARCHITECTURE.md) and
+[the ABI header](internal/native/orbit_go.h) for ownership contracts.
