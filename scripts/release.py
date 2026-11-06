@@ -75,10 +75,13 @@ def source_files(root):
 
 
 def context(root):
-    """What a library is built from: the version and every tracked file."""
+    """What a library is built from: the version and the files Cargo reads."""
     version = tomllib.loads((root / "native/Cargo.toml").read_text())["package"]["version"]
     digest = hashlib.sha256()
     for path in source_files(root):
+        relative = path.relative_to(root).as_posix()
+        if relative != "Cargo.toml" and not relative.startswith(("native/", "harness/")):
+            continue
         data = path.read_bytes()
         digest.update(str(path.relative_to(root)).encode() + b"\0" + str(len(data)).encode() + b"\0" + data)
     return {"version": version, "source": digest.hexdigest()}

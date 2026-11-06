@@ -67,7 +67,7 @@ def transfer(root, target, source, release, expected):
     (root / "prebuilds").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".collect-", dir=root / "prebuilds") as temporary:
         temporary = Path(temporary)
-        command(["rsync", "-rt", "--protect-args", "--include=/" + library,
+        command(["rsync", "-rt", "--protect-args", "-e", "ssh -o ConnectionAttempts=3", "--include=/" + library,
                  "--include=/release.json", "--exclude=*", "--", source.rstrip("/") + "/", str(temporary) + "/"])
         data, receipt = release.read_native(root, target, expected, temporary)
         if release.context(root) != expected:
@@ -104,7 +104,7 @@ def build_all(root, configuration, selected=(), dry_run=False):
         logfile = record / (host["name"] + ".log")
         try:
             with logfile.open("w") as log:
-                with subprocess.Popen(["ssh", "-T", "-o", "BatchMode=yes", "--", host["ssh"],
+                with subprocess.Popen(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectionAttempts=3", "--", host["ssh"],
                     "bash -l -c " + shlex.quote(bootstrap)], cwd=root, stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as child:
                     result = None
