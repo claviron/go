@@ -56,6 +56,10 @@ def hosts(config, selected, release):
             raise ValueError("jobs must be a positive integer")
         if "nice" in value and (type(value["nice"]) is not int or not -20 <= value["nice"] <= 19):
             raise ValueError("nice must be between -20 and 19")
+        if "docker" in value and (type(value["docker"]) is not bool or (value["docker"] and release.selected_target(value["target"]) != "freebsd-x86_64")):
+            raise ValueError("docker is a boolean, for the FreeBSD x64 target only")
+        if "dockerNetwork" in value and not re.fullmatch(r"[A-Za-z0-9_.-]+", str(value["dockerNetwork"])):
+            raise ValueError("dockerNetwork must name a Docker network")
         result.append({**value, "name": name, "target": release.selected_target(value["target"])})
     if len({value["target"] for value in result}) != len(result):
         raise ValueError("Select only one builder per target")
@@ -152,6 +156,10 @@ def worker(job):
         if "jobs" in request:
             env["CARGO_BUILD_JOBS"] = str(request["jobs"])
         arguments = [sys.executable, "scripts/release.py", "--prepare", "--target", request["target"]]
+        if request.get("docker"):
+            arguments = ["bash", "scripts/prepare-freebsd.sh"]
+            if "dockerNetwork" in request:
+                env["CLAVIRON_FREEBSD_BUILD_NETWORK"] = request["dockerNetwork"]
         if "nice" in request:
             arguments = ["nice", "-n", str(request["nice"]), *arguments]
         command(arguments, cwd=source, env=env)
