@@ -7,3 +7,4 @@
 /.cargo/config.toml
 /Cargo.lock
 __pycache__/
+/.idea/
