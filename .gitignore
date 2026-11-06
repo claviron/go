@@ -1,0 +1,6 @@
+/AGENTS.local.md
+*.local.sh
+.DS_Store
+/target/
+/prebuilds/
+/.hosts
