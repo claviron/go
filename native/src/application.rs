@@ -1,4 +1,6 @@
+mod events;
 mod io;
+pub(crate) mod lifecycle;
 mod status;
 
 use futures_util::FutureExt;
@@ -42,6 +44,9 @@ pub struct State {
     closed: AtomicBool,
     delivered: AtomicBool,
     pub unsupported: AtomicU64,
+    pub lifecycle: lifecycle::Lifecycle,
+    events: Arc<events::Events>,
+    transition: Mutex<()>,
 }
 
 pub use io::Exchange;
@@ -54,7 +59,7 @@ impl Application {
             .enable_all()
             .build()
             .map_err(|_| Status::Transport)?;
-        let (state, receiver) = runtime.block_on(async {
+        let (state, receiver, events) = runtime.block_on(async {
             let segment = Arc::new(
                 ApplicationSegment::for_fleet(&options.fleet)
                     .map_err(|_| Status::Transport)?,
@@ -75,9 +80,14 @@ impl Application {
                 let receiver = segment
                     .receiver(joined.lane)
                     .map_err(|_| Status::Transport)?;
-                Ok((bodies, receiver))
+                let (events, event_reader) = events::Events::open(
+                    &options.fleet,
+                    &options.name,
+                    joined.lane,
+                )?;
+                Ok((bodies, receiver, events, event_reader))
             })();
-            let (bodies, receiver) = match setup {
+            let (bodies, receiver, events, event_reader) = match setup {
                 Ok(value) => value,
                 Err(error) => {
                     let _ = segment.inbox().release_lane(joined.lane);
@@ -88,7 +98,9 @@ impl Application {
             // one read and one output result. The extra slot belongs to Closed.
             // Admission credits are retained until explicit exchange release.
             let (send, receive) =
-                mpsc::sync_channel(options.max_exchanges * 5 + 1);
+                mpsc::sync_channel(options.max_exchanges * 5 + 2);
+            let stop = CancellationToken::new();
+            let lifecycle = lifecycle::Lifecycle::new(stop.clone());
             Ok((
                 Arc::new(State {
                     options,
@@ -98,7 +110,10 @@ impl Application {
                     hold: Mutex::new(Some(hold)),
                     send,
                     receive: Mutex::new(receive),
-                    stop: CancellationToken::new(),
+                    stop,
+                    lifecycle,
+                    events,
+                    transition: Mutex::new(()),
                     withdraw: CancellationToken::new(),
                     retained: AtomicUsize::new(0),
                     running: AtomicUsize::new(0),
@@ -108,11 +123,12 @@ impl Application {
                     unsupported: AtomicU64::new(0),
                 }),
                 receiver,
+                event_reader,
             ))
         })?;
         let driving = Arc::clone(&state);
         runtime.spawn(async move {
-            let outcome = AssertUnwindSafe(driving.drive(receiver))
+            let outcome = AssertUnwindSafe(driving.drive(receiver, events))
                 .catch_unwind()
                 .await
                 .unwrap_or(Status::Panic);
@@ -138,6 +154,9 @@ impl State {
             || event.kind == EventKind::Output as u32
         {
             registry::exchange(event.exchange)?.delivered(event.kind)?;
+        }
+        if event.kind == EventKind::Lifecycle as u32 {
+            self.lifecycle.delivered()?;
         }
         if event.kind == EventKind::Closed as u32 {
             self.delivered.store(true, Ordering::Release);
@@ -175,6 +194,7 @@ impl State {
     async fn drive(
         self: &Arc<Self>,
         mut receiver: InboxReceiver,
+        mut events: events::Reader,
     ) -> Status {
         let mut bytes = Vec::new();
         let outcome = loop {
@@ -182,6 +202,12 @@ impl State {
                 biased;
                 () = self.stop.cancelled() => break Status::Ok,
                 () = self.withdraw.cancelled() => break Status::Ok,
+                action = events.next() => {
+                    match action.and_then(|action| self.apply_from_ring(action)) {
+                        Ok(()) => continue,
+                        Err(error) => break error,
+                    }
+                }
                 received = receiver.next(&mut bytes) => received,
             };
             match received {
@@ -211,6 +237,19 @@ impl State {
                         }
                         continue;
                     }
+                    if command.application == *self.options.name
+                        && command.target.as_ref().is_some_and(|target| {
+                            target.runtime == "go"
+                                && target.name == *self.options.name
+                        })
+                        && let Some(action) =
+                            lifecycle::Action::from_name(&command.name)
+                    {
+                        if let Err(error) = self.action(action) {
+                            break error;
+                        }
+                        continue;
+                    }
                     self.unsupported.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -236,6 +275,14 @@ impl State {
                 self.refuse(frame, 501).await;
                 continue;
             }
+            let generation = match self.lifecycle.capture() {
+                Ok(Some(generation)) => generation,
+                Ok(None) => {
+                    self.refuse(frame, 503).await;
+                    continue;
+                }
+                Err(error) => break error,
+            };
             if self.retained.fetch_add(1, Ordering::AcqRel)
                 >= self.options.max_exchanges
             {
@@ -244,7 +291,7 @@ impl State {
                 continue;
             }
             let (exchange, input, output) =
-                Exchange::new(Arc::clone(self), frame);
+                Exchange::new(Arc::clone(self), frame, generation);
             let id = match registry::insert_exchange(Arc::clone(&exchange)) {
                 Ok(id) => id,
                 Err(error) => {
@@ -324,3 +371,36 @@ impl State {
 #[cfg(test)]
 #[path = "../tests/application.rs"]
 mod tests;
+
+impl State {
+    pub fn action(
+        &self,
+        action: lifecycle::Action,
+    ) -> Result<()> {
+        let _transition = self.transition.lock().map_err(|_| Status::Panic)?;
+        if self.stop.is_cancelled() || self.withdraw.is_cancelled() {
+            return Err(Status::Closed);
+        }
+        // The transition lock also covers remote application, so capacity is
+        // checked before publishing a decision this instance cannot apply.
+        self.lifecycle.validate(action)?;
+        self.events.publish(action)?;
+        self.apply(action)
+    }
+    fn apply_from_ring(
+        &self,
+        action: lifecycle::Action,
+    ) -> Result<()> {
+        let _transition = self.transition.lock().map_err(|_| Status::Panic)?;
+        self.apply(action)
+    }
+    fn apply(
+        &self,
+        action: lifecycle::Action,
+    ) -> Result<()> {
+        if self.lifecycle.apply(action)? {
+            self.event(EventKind::Lifecycle, 0, Status::Ok);
+        }
+        self.publish_status()
+    }
+}

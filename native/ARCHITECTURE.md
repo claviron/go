@@ -8,6 +8,8 @@ C ABI implemented by `abi.rs`; `registry.rs` pins typed owners for each call;
 `application.rs` owns Link membership and application drain.
 `application/io.rs` owns independent read/write actors, reserved completion
 slots and terminal exchange completion.
+`application/lifecycle.rs` owns checked generation state and notification credit.
+`application/events.rs` owns the private notified event-ring cursor and fan-out.
 `application/status.rs` uses the existing Claviron application status schema.
 
 Dependencies enter through the public `claviron` facade. No internal Claviron

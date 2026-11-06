@@ -4,7 +4,7 @@ use super::*;
 fn abi_layout_and_invalid_arguments_are_explicit() {
     let mut abi = Abi::default();
     assert_eq!(unsafe { og_abi(&mut abi) }, 0);
-    assert_eq!(abi.version, 2);
+    assert_eq!(abi.version, 3);
     assert_eq!(abi.event_size as usize, size_of::<Event>());
     assert_eq!(
         unsafe { og_abi(ptr::null_mut()) },
@@ -49,4 +49,16 @@ fn incompatible_abi_is_rejected_before_join() {
 #[test]
 fn recoverable_unwind_becomes_explicit_status() {
     assert_eq!(boundary(|| panic!("ABI test")), Status::Panic as u32);
+}
+
+#[test]
+fn abi_query_keeps_the_original_record_extent_for_older_callers() {
+    // Older bindings must be able to query the version before they decide
+    // whether to call any of the new record-taking functions.
+    assert_eq!(size_of::<Abi>(), 56);
+    #[repr(align(8))]
+    struct Storage([u8; 64]);
+    let mut storage = Storage([0xa5; 64]);
+    assert_eq!(unsafe { og_abi(storage.0.as_mut_ptr().cast::<Abi>()) }, 0);
+    assert_eq!(&storage.0[56..], &[0xa5; 8]);
 }

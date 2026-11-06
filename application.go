@@ -38,17 +38,21 @@ type exchangeState struct {
 // One native completion waiter and NativeThreads native I/O threads serve it.
 // User handlers run on Go goroutines and never on the native I/O owner.
 type Application struct {
-	mu        sync.Mutex
-	handle    native.Handle
-	options   Options
-	handler   http.Handler
-	lane      uint64
-	active    map[native.Handle]*exchangeState
-	workers   sync.WaitGroup
-	ioWorkers sync.WaitGroup
-	done      chan struct{}
-	err       error
-	terminal  bool
+	mu                sync.Mutex
+	handle            native.Handle
+	options           Options
+	handler           http.Handler
+	lane              uint64
+	active            map[native.Handle]*exchangeState
+	workers           sync.WaitGroup
+	ioWorkers         sync.WaitGroup
+	done              chan struct{}
+	err               error
+	terminal          bool
+	lifecycle         Snapshot
+	generationContext context.Context
+	generationCancel  context.CancelFunc
+	changes           chan struct{}
 }
 
 // Open joins the Link and begins serving the supplied handler. It opens no
@@ -63,7 +67,15 @@ func Open(options Options, handler http.Handler) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
-	app := &Application{handle: handle, lane: lane, options: options, handler: handler, active: make(map[native.Handle]*exchangeState), done: make(chan struct{})}
+	app := &Application{handle: handle, lane: lane, options: options, handler: handler, active: make(map[native.Handle]*exchangeState), done: make(chan struct{}), changes: make(chan struct{}, 1)}
+	initial, err := native.Snapshot(handle, false)
+	if err != nil {
+		_ = native.Cancel(handle)
+		go app.pump()
+		<-app.Done()
+		return nil, err
+	}
+	app.syncLifecycle(initial)
 	go app.pump()
 	return app, nil
 }
@@ -102,6 +114,9 @@ func (a *Application) Shutdown(ctx context.Context) error {
 func (a *Application) Close() error {
 	a.mu.Lock()
 	if !a.terminal {
+		if a.generationCancel != nil {
+			a.generationCancel()
+		}
 		_ = native.Cancel(a.handle)
 		for _, exchange := range a.active {
 			exchange.cancel()
@@ -154,6 +169,9 @@ func (a *Application) pump() {
 		case 1:
 			request, err := native.ReadRequest(event.Exchange)
 			ctx, cancel := context.WithCancel(context.Background())
+			if request.Cancelled {
+				cancel()
+			}
 			a.mu.Lock()
 			a.active[event.Exchange] = &exchangeState{cancel: cancel, readDone: make(chan struct{}, 1), outputDone: make(chan struct{}, 1)}
 			a.workers.Add(1)
@@ -177,6 +195,9 @@ func (a *Application) pump() {
 		case 4:
 			a.mu.Lock()
 			a.terminal = true
+			if a.generationCancel != nil {
+				a.generationCancel()
+			}
 			if event.Status != 0 {
 				a.setError(native.Status(event.Status))
 			}
@@ -189,8 +210,19 @@ func (a *Application) pump() {
 			a.mu.Lock()
 			a.setError(native.Release(a.handle))
 			a.mu.Unlock()
+			close(a.changes)
 			close(a.done)
 			return
+		case 7:
+			snapshot, err := native.Snapshot(a.handle, true)
+			a.mu.Lock()
+			if err != nil {
+				a.setError(err)
+				_ = native.Cancel(a.handle)
+			} else {
+				a.syncLifecycle(snapshot)
+			}
+			a.mu.Unlock()
 		case 5, 6:
 			a.mu.Lock()
 			state := a.active[event.Exchange]

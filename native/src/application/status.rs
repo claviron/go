@@ -1,4 +1,4 @@
-//! Initial reachability/status schema; application lifecycle changes follow later.
+//! Authoritative application generation/status rows for the existing schema.
 use std::time::SystemTime;
 
 use claviron::app::fleet::{
@@ -17,6 +17,7 @@ use crate::abi::{Result, Status};
 impl State {
     pub(super) fn publish_status(&self) -> Result<()> {
         let now = SystemTime::now();
+        let state = self.lifecycle.snapshot()?;
         let member = FleetMember {
             node_id: self.lane as u16,
             role: FleetMemberRole::Standalone,
@@ -35,9 +36,13 @@ impl State {
                 placements: vec![FleetApplicationPlacement {
                     member,
                     description: ApplicationDescription::new("go", "net/http"),
-                    lifecycle: ApplicationLifecycle::Running,
-                    enabled: true,
-                    generation: 1,
+                    lifecycle: if state.running != 0 {
+                        ApplicationLifecycle::Running
+                    } else {
+                        ApplicationLifecycle::Stopped
+                    },
+                    enabled: state.running != 0,
+                    generation: state.generation,
                     pool: None,
                     last_error: None,
                     last_error_truncated: false,

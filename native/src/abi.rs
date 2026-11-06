@@ -1,4 +1,4 @@
-//! C ABI version two: checked handles, borrowed call inputs and copy-out data.
+//! C ABI version three: checked handles, borrowed call inputs and copy-out data.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -34,6 +34,7 @@ pub enum EventKind {
     Closed = 4,
     Read = 5,
     Output = 6,
+    Lifecycle = 7,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -90,7 +91,7 @@ impl Options {
             || self
                 .max_exchanges
                 .checked_mul(5)
-                .and_then(|n| n.checked_add(1))
+                .and_then(|n| n.checked_add(2))
                 .is_none()
         {
             return Err(Status::InvalidArgument);
@@ -109,6 +110,9 @@ pub struct RequestInfo {
     pub version_minor: u32,
     pub header_count: u32,
     pub body_stream: u32,
+    pub generation: u64,
+    pub cancelled: u32,
+    pub reserved: u32,
 }
 
 fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
@@ -183,7 +187,7 @@ pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {
         output(
             out,
             Abi {
-                version: 2,
+                version: 3,
                 event_size: size_of::<Event>() as u32,
                 options_size: size_of::<OpenOptions>() as u32,
                 info_size: size_of::<RequestInfo>() as u32,
@@ -217,7 +221,7 @@ pub unsafe extern "C" fn og_open(
             out.write(0);
         }
         let options = unsafe { &*options };
-        if options.abi_version != 2 {
+        if options.abi_version != 3 {
             return Err(Status::Unsupported);
         }
         let fleet = std::str::from_utf8(unsafe { bytes(fleet, fleet_len)? })
@@ -311,6 +315,9 @@ pub unsafe extern "C" fn og_request_info(
             version_minor: minor,
             header_count: exchange.frame.headers.len() as u32,
             body_stream: u32::from(exchange.frame.body.is_some()),
+            generation: exchange.generation.id,
+            cancelled: u32::from(exchange.cancel.is_cancelled()),
+            reserved: 0,
         };
         unsafe { output(out, info) }
     })
@@ -493,5 +500,42 @@ pub unsafe extern "C" fn og_output_result(
             output(written, count as u64)?;
         }
         if status == Status::Ok { Ok(()) } else { Err(status) }
+    })
+}
+
+/// # Safety
+/// out points to one lifecycle Snapshot. This does not consume a notification.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_snapshot(
+    app: u64,
+    out: *mut crate::application::lifecycle::Snapshot,
+) -> u32 {
+    boundary(|| unsafe {
+        output(out, registry::application(app)?.lifecycle.snapshot()?)
+    })
+}
+/// # Safety
+/// out points to one lifecycle Snapshot. Requires the lifecycle event and
+/// consumes its coalesced notification credit, returning the newest snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_lifecycle_result(
+    app: u64,
+    out: *mut crate::application::lifecycle::Snapshot,
+) -> u32 {
+    boundary(|| {
+        if out.is_null() {
+            return Err(Status::InvalidArgument);
+        }
+        unsafe { output(out, registry::application(app)?.lifecycle.consume()?) }
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn og_lifecycle(
+    app: u64,
+    action: u32,
+) -> u32 {
+    boundary(|| {
+        registry::application(app)?
+            .action(crate::application::lifecycle::Action::from_code(action)?)
     })
 }

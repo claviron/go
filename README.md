@@ -13,10 +13,10 @@ implemented through a versioned C ABI and private cgo adapter. A normal Go
 the request is still arriving. Read and output operations have independent
 native owners and bounded buffers.
 
-Application status uses Claviron's existing schema. Application start/stop/restart,
-event subscriptions and invoke remain later stages. Unsupported management/event
-frames are counted by `UnsupportedFrames`; they perform no operation or success
-acknowledgement. An edge-shutdown notice does not cancel another caller's work.
+Application status uses Claviron's existing schema. Application start/stop/restart and generation cancellation are supported.
+Public event subscriptions and invoke remain later stages. Unsupported management/event
+frames outside the supported lifecycle/status contract are counted by
+`UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
 This is unreleased source. The intended module path is
 `github.com/claviron/orbit-go`; no public Go release or native prebuild is
@@ -113,11 +113,70 @@ The complete Go example has three routes:
 Its `--io-buffer-bytes`, `--max-request-bytes` and `--max-response-bytes` flags
 configure the budgets. Signal handling belongs to the example, not the library.
 
+## Application lifecycle
+
+Application lifecycle is separate from connection shutdown. `Start`, `Stop` and
+`Restart` leave the Link lane, native I/O host and Go process alive:
+
+| Action | State and generation |
+| --- | --- |
+| Start while running | No change. |
+| Start while stopped | Open a new running generation. |
+| Stop | Mark stopped and cancel the current generation; retain its number. |
+| Restart | Cancel the previous generation and open a new running one. |
+
+A stopped application returns 503 without calling the Go handler. New requests
+capture an immutable generation, available through `Generation(r)`.
+Stop/restart cancels their `Request.Context`, including blocked body reads and
+response writes. Delayed handlers cannot publish a reply using a retired
+native owner, even while the next generation is serving. Cancellation does not
+kill goroutines or undo application side effects.
+
+```go
+snapshot, err := app.Snapshot() // Generation, Revision, Running
+if err != nil { panic(err) }
+_ = snapshot
+
+ctx, err := app.GenerationContext() // scope caller-owned background work
+if err != nil { panic(err) }
+_ = ctx // observe ctx.Done(); the caller still owns starting/joining its jobs
+
+if err := app.Stop(); err != nil { panic(err) }
+if err := app.Start(); err != nil { panic(err) }
+if err := app.Restart(); err != nil { panic(err) }
+```
+
+`Changes()` is a bounded, coalescing state notification: after a signal, read
+Snapshot or GenerationContext for current local state. It is not an action log.
+Revision orders state observations so a delayed notification cannot resurrect
+an old generation context. A new generation receives a fresh context. Close
+also cancels the generation context; Shutdown preserves accepted work through
+its normal drain before final connection closure.
+
+Claviron management uses the existing application ControlCommand with both a
+`go` runtime target and matching application name. Wrong-runtime/name or
+unqualified lifecycle commands do not execute. A decision received by one
+instance is spread to currently connected same-name Go instances through the
+existing notified application-event ring. This private fan-out is implemented;
+it does not expose the public application-events API yet.
+
+Fan-out is asynchronous, not an atomic fleet transaction or durable command log.
+A local API result is not a sibling acknowledgement. Serialize management
+changes and observe each instance's status when a coordinated transition is
+required. A newly opened connection starts at generation 1; retained ring
+history is not replayed as its initial application policy. Reader lag is surfaced
+as a connection error rather than silently losing lifecycle decisions.
+
+The Go example also exposes `GET /generation` and `GET /wait-generation`:
+the latter flushes a head and waits for its request generation to be cancelled.
+No lifecycle operation restarts the example's Go process.
+
 ## ABI migration
 
-ABI v2 replaces the initial buffered v1 body submission with read, head, write,
-finish and result-consumption operations. Rebuild the Go package and its matching
-native library together. Existing v1 binaries are rejected before joining. Go
+ABI v3 adds generation metadata, lifecycle actions, snapshots and a coalesced
+lifecycle notification to v2 streaming operations. Rebuild the Go package and
+its matching native library together. Older bindings are rejected before joining;
+the version-query record keeps its original extent so they can query safely. Go
 callers must now supply `IOBufferBytes`; zero total body limits mean unlimited
 payload length. The canonical C header lives in the cgo package so Go's build
 cache tracks header changes as well as Go source changes.
@@ -150,7 +209,11 @@ addresses, bounded bodies, HEAD, concurrent application instances, cancellation,
 handler panic before/after commit, failed reply publication and graceful drain.
 It fills the upload window and proves the next write is pending, transfers bodies
 larger than the stream window in both directions, cancels reads/writes, and
-sends SIGTERM to the actual Go example during a streaming response. It stops its own
+sends SIGTERM to the actual Go example during a streaming response. Lifecycle
+acceptance verifies two-instance fan-out, wrong-target isolation, generation
+context cancellation, delayed old handlers, Go lifecycle APIs and unchanged
+process/lane ownership. The actual Go example is stopped, started and restarted
+through real Claviron control frames. It stops its own
 processes before clearing its unique fleet and preserves failed fleets for
 inspection. No production listener or load benchmark is involved.
 

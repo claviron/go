@@ -4,7 +4,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 2. Inputs live only for the call; native never retains Go pointers.
+/* ABI 3. Inputs live only for the call; native never retains Go pointers.
  * Outputs must be aligned and writable. Copy-out buffers may not overlap inputs.
  * Status: 0 OK, 1 invalid argument, 2 stale/wrong-kind handle, 3 closed,
  * 4 capacity, 5 unsupported, 6 transport, 7 contained panic, 8 busy, 9 cancelled, 10 body limit.
@@ -21,11 +21,14 @@ typedef struct {
 typedef struct { uint32_t kind, status; uint64_t exchange; } og_event;
 typedef struct {
     uint32_t version_major, version_minor, header_count, body_stream;
+    uint64_t generation;
+    uint32_t cancelled, reserved;
 } og_request_info_record;
+typedef struct { uint64_t generation, revision, running; } og_snapshot_record;
 uint32_t og_abi(og_abi_info *out);
 uint32_t og_open(const uint8_t *fleet, uint64_t fleet_len, const uint8_t *name, uint64_t name_len, const og_options *options, uint64_t *out);
 /* Only og_wait blocks: one waiter per application, explicitly woken by close.
- * Events: 1 request, 2 cancelled, 3 complete (exactly once), 4 application closed, 5 read result, 6 output result.
+ * Events: 1 request, 2 cancelled, 3 complete (exactly once), 4 application closed, 5 read result, 6 output result, 7 lifecycle state change (coalesced).
  * Each exchange retains admission/completion credit until exchange_release.
  * Submit success means accepted native work, not response delivery.
  */
@@ -35,6 +38,13 @@ uint32_t og_cancel(uint64_t app);
 uint32_t og_release(uint64_t app);
 uint32_t og_lane(uint64_t app, uint64_t *out);
 uint32_t og_unsupported(uint64_t app, uint64_t *out);
+/* Lifecycle actions are application-wide among currently connected same-name
+ * Go instances: 1 start, 2 stop, 3 restart. Membership is retained. Snapshot is
+ * authoritative local state; lifecycle_result consumes the delivered wake and
+ * returns the latest state, not an action history. */
+uint32_t og_lifecycle(uint64_t app, uint32_t action);
+uint32_t og_snapshot(uint64_t app, og_snapshot_record *out);
+uint32_t og_lifecycle_result(uint64_t app, og_snapshot_record *out);
 uint32_t og_request_info(uint64_t exchange, og_request_info_record *out);
 /* field: 1 method, 2 scheme, 3 raw path, 4 query, 5 peer, 6 local,
  * 8 header name, 9 header value. index is used for headers only.

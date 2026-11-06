@@ -19,8 +19,9 @@ import (
 // Header retains the ordered, original Link header name and value.
 type Header struct{ Name, Value string }
 type requestMetadata struct {
-	headers []Header
-	scheme  string
+	headers    []Header
+	scheme     string
+	generation uint64
 }
 type metadataKey struct{}
 
@@ -32,6 +33,12 @@ func RawHeaders(r *http.Request) []Header {
 
 // Scheme reports the authoritative scheme supplied by the Claviron caller.
 // Request.TLS is nil: this Go process did not perform that TLS handshake.
+// Generation reports the immutable generation that accepted this request.
+func Generation(r *http.Request) uint64 {
+	data, _ := r.Context().Value(metadataKey{}).(requestMetadata)
+	return data.generation
+}
+
 func Scheme(r *http.Request) string {
 	data, _ := r.Context().Value(metadataKey{}).(requestMetadata)
 	return data.scheme
@@ -69,7 +76,7 @@ func requestFromNative(input native.Request, body io.ReadCloser, ctx context.Con
 	if host == "" {
 		host = input.Local
 	}
-	metadata := requestMetadata{headers: raw, scheme: input.Scheme}
+	metadata := requestMetadata{headers: raw, scheme: input.Scheme, generation: input.Generation}
 	ctx = context.WithValue(ctx, metadataKey{}, metadata)
 	if address, err := netip.ParseAddrPort(input.Local); err == nil {
 		ctx = context.WithValue(ctx, http.LocalAddrContextKey, net.TCPAddrFromAddrPort(address))
@@ -104,6 +111,10 @@ func requestFromNative(input native.Request, body io.ReadCloser, ctx context.Con
 func (a *Application) dispatch(id native.Handle, input native.Request, ctx context.Context, mappingError error) {
 	defer a.workers.Done()
 	defer a.complete(id, true)
+	if ctx.Err() != nil {
+		_ = native.Abort(id)
+		return
+	}
 	body := &inputBody{app: a, id: id}
 	defer body.Close()
 	sink := &nativeSink{app: a, id: id}

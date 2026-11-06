@@ -48,6 +48,8 @@ type Request struct {
 	Major, Minor                             int
 	Headers                                  []Header
 	HasBodyStream                            bool
+	Generation                               uint64
+	Cancelled                                bool
 }
 
 func stringData(value string) *C.uint8_t {
@@ -60,10 +62,10 @@ func Open(o Options) (Handle, uint64, error) {
 	if err := check(C.og_abi(&abi)); err != nil {
 		return 0, 0, err
 	}
-	if abi.version != 2 || uintptr(abi.event_size) != unsafe.Sizeof(C.og_event{}) || uintptr(abi.options_size) != unsafe.Sizeof(C.og_options{}) || uintptr(abi.info_size) != unsafe.Sizeof(C.og_request_info_record{}) {
+	if abi.version != 3 || uintptr(abi.event_size) != unsafe.Sizeof(C.og_event{}) || uintptr(abi.options_size) != unsafe.Sizeof(C.og_options{}) || uintptr(abi.info_size) != unsafe.Sizeof(C.og_request_info_record{}) {
 		return 0, 0, fmt.Errorf("orbit-go: incompatible native ABI")
 	}
-	opts := C.og_options{abi_version: 2, native_threads: C.uint32_t(o.NativeThreads), incarnation: C.uint64_t(o.Incarnation), max_exchanges: C.uint64_t(o.MaxExchanges), max_request_bytes: C.uint64_t(o.MaxRequestBytes), max_response_bytes: C.uint64_t(o.MaxResponseBytes), io_buffer_bytes: C.uint64_t(o.IOBufferBytes)}
+	opts := C.og_options{abi_version: 3, native_threads: C.uint32_t(o.NativeThreads), incarnation: C.uint64_t(o.Incarnation), max_exchanges: C.uint64_t(o.MaxExchanges), max_request_bytes: C.uint64_t(o.MaxRequestBytes), max_response_bytes: C.uint64_t(o.MaxResponseBytes), io_buffer_bytes: C.uint64_t(o.IOBufferBytes)}
 	var handle, lane C.uint64_t
 	err := check(C.og_open(stringData(o.Fleet), C.uint64_t(len(o.Fleet)), stringData(o.Name), C.uint64_t(len(o.Name)), &opts, &handle))
 	runtime.KeepAlive(o)
@@ -107,7 +109,7 @@ func ReadRequest(exchange Handle) (Request, error) {
 	if err := check(C.og_request_info(C.uint64_t(exchange), &info)); err != nil {
 		return Request{}, err
 	}
-	r := Request{Major: int(info.version_major), Minor: int(info.version_minor), HasBodyStream: info.body_stream != 0}
+	r := Request{Major: int(info.version_major), Minor: int(info.version_minor), HasBodyStream: info.body_stream != 0, Generation: uint64(info.generation), Cancelled: info.cancelled != 0}
 	fields := []*string{&r.Method, &r.Scheme, &r.Path, &r.Query, &r.Peer, &r.Local}
 	for i, out := range fields {
 		data, err := field(exchange, uint32(i+1), 0)
@@ -183,4 +185,23 @@ func Unsupported(app Handle) (uint64, error) {
 	var count C.uint64_t
 	err := check(C.og_unsupported(C.uint64_t(app), &count))
 	return uint64(count), err
+}
+
+type LifecycleState struct {
+	Generation, Revision uint64
+	Running              bool
+}
+
+func Lifecycle(app Handle, action uint32) error {
+	return check(C.og_lifecycle(C.uint64_t(app), C.uint32_t(action)))
+}
+func Snapshot(app Handle, consume bool) (LifecycleState, error) {
+	var value C.og_snapshot_record
+	var code C.uint32_t
+	if consume {
+		code = C.og_lifecycle_result(C.uint64_t(app), &value)
+	} else {
+		code = C.og_snapshot(C.uint64_t(app), &value)
+	}
+	return LifecycleState{Generation: uint64(value.generation), Revision: uint64(value.revision), Running: value.running != 0}, check(code)
 }

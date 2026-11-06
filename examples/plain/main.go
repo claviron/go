@@ -27,6 +27,16 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /generation", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, orbitgo.Generation(r))
+	})
+	mux.HandleFunc("GET /wait-generation", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Generation", strconv.FormatUint(orbitgo.Generation(r), 10))
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return
+		}
+		<-r.Context().Done()
+	})
 	mux.HandleFunc("POST /echo", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		if _, err := io.CopyBuffer(w, r.Body, make([]byte, int(*buffer))); err != nil {

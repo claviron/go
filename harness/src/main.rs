@@ -1,4 +1,5 @@
 //! Isolated real-Link caller. The application under test is a Go executable.
+mod lifecycle;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::future::poll_fn;
@@ -303,6 +304,7 @@ async fn run(
     println!(
         "PASS unsupported management is observable and never executed; foreign shutdown does not cancel admitted work"
     );
+    lifecycle::fixtures(&binary, fleet, &client, &segment).await?;
     streaming(&binary, &example, fleet, &client, &segment).await?;
     client.leave();
     drop(client);
@@ -461,6 +463,9 @@ async fn example_streaming(
     println!(
         "PASS actual Go example: response bytes arrive before upload EOF, larger-than-window echo"
     );
+
+    lifecycle::example(client, segment, lane, child.id().ok_or("example pid")?)
+        .await?;
 
     let mut request = frame("/stream");
     request.query = format!("bytes={}", LINK_BUFFER_BYTES * 4).into_bytes();

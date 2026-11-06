@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::State;
+use super::lifecycle::Generation;
 use crate::abi::{EventKind, Result, Status};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,6 +95,7 @@ pub(super) enum Command {
 pub struct Exchange {
     pub application: Arc<State>,
     pub frame: Frame,
+    pub generation: Arc<Generation>,
     head: Mutex<Option<Head>>,
     input: Mutex<InputState>,
     output: Mutex<OutputState>,
@@ -109,12 +111,14 @@ impl Exchange {
     pub(super) fn new(
         application: Arc<State>,
         frame: Frame,
+        generation: Arc<Generation>,
     ) -> (Arc<Self>, mpsc::Receiver<usize>, mpsc::Receiver<Command>) {
         // A slot is an operation owner, not an additional admission queue.
         let (reads, input) = mpsc::channel(1);
         let (writes, output) = mpsc::channel(1);
         let owner = Arc::new(Self {
-            cancel: application.stop.child_token(),
+            cancel: generation.cancelled.child_token(),
+            generation,
             application,
             frame,
             head: Mutex::new(None),

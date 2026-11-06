@@ -15,16 +15,19 @@ in Go. The separate direct-integration Go FFI project is not a dependency.
 ## Sources
 
 - `application.go`: Go application ownership, completion pump and shutdown.
+- `lifecycle.go`: authoritative snapshots, generation contexts and coalesced state wakes.
 - `http.go`: server request mapping, raw headers and handler dispatch.
 - `body.go`: lazy, serialized reads and concurrent input closure.
 - `internal/native/native.go`: private cgo calls and copy-out metadata.
 - `internal/httpadapter/response.go`: streaming response ownership and net/http behavior.
-- `internal/native/orbit_go.h`: ABI version two and ownership rules.
+- `internal/native/orbit_go.h`: ABI version three and ownership rules.
 - `native/src/abi.rs`: checked downcalls and unwind containment.
 - `native/src/registry.rs`: never-reused, kind-checked application/exchange handles.
 - `native/src/application.rs`: Link membership, frame dispatch and application drain.
 - `native/src/application/io.rs`: independent input/output actors, operation slots
   and terminal exchange completion.
+- `native/src/application/lifecycle.rs`: checked generation transitions and state-notification credit.
+- `native/src/application/events.rs`: private notified lifecycle fan-out among live Go instances.
 - `native/src/application/status.rs`: existing application status schema, with
   Go identity and `net/http` request mode. No custom runner is reported.
 - `examples/plain/main.go`: an ordinary Go application using the library.
@@ -44,7 +47,7 @@ events, rather than by blocking a handler in cgo for the duration of I/O.
 
 `MaxExchanges` bounds retained exchange handles. Each credit reserves Request,
 Cancelled, Complete and at most one unconsumed Read result and Output result;
-one additional queue slot belongs to Closed. Each direction admits one operation
+two additional queue slots belong to Closed and a coalesced lifecycle wake. Each direction admits one operation
 at a time. A result becomes reusable only after its event has been delivered AND
 its data/status consumed. Terminal delivery is also checked before release.
 This prevents early result consumption from recycling credit while old events
@@ -74,7 +77,7 @@ validation. A native ABI match is not proof of peer wire compatibility.
 
 ## HTTP streaming behavior
 
-ABI v2 dispatches after the request head and stream ownership are ready. It does
+The streaming binding dispatches after the request head and stream ownership are ready. It does
 not pre-read the complete upload. Request.Body serializes reads; Close signals
 the native input owner without waiting behind a blocked Read. Input EOF and
 read closure are independent of response FIN. A present stream without declared
@@ -106,7 +109,9 @@ The Link API supplies byte streams without a trailer envelope; trailers,
 informational responses, upgrades, hijacking and push are not advertised.
 
 The canonical ABI header is in internal/native so the Go package cache includes
-it. The binding checks v2 and fixed record sizes before opening; v1 is incompatible.
+it. The binding checks v3 and fixed record sizes before opening; older bindings are incompatible.
+The ABI query record retains its original 56-byte extent so old callers can
+inspect the version before invoking any new record-taking function.
 
 ## Lifecycle scope
 
@@ -122,11 +127,52 @@ finishes. Closing never unlinks a fleet or closes a sibling lane. Status queries
 use Claviron's application schema, reporting this connected application; they
 are not an assertion that every handler is healthy.
 
-Start/stop/restart, application events and edge-shutdown callbacks belong to a
-later stage. Unsupported frames increment `UnsupportedFrames` and perform no
-operation or success acknowledgement. In particular, a shutdown notice from
-one edge cannot cancel work admitted by another. Malformed protocol input or
-an actual reader failure instead terminates the connection with an error.
+## Application generations
+
+The initial application is running at generation 1, revision 1. A running Start
+and a stopped Stop are idempotent. Stop retains the generation number and
+cancels its token. Start after stop and every Restart create a new generation.
+Generation and revision exhaustion are checked before cancellation or publication.
+
+A native exchange captures one Arc-owned generation before dispatch. Its I/O
+cancellation token is a child of that generation, itself below the application's
+connection-stop token. Requests retain that immutable ID through the ABI and
+Generation(r). Stopped applications refuse with 503 without running a handler.
+Native operations check their old owner's cancellation; a delayed handler never
+acquires the current generation or writes to a new request's ticket.
+
+Go request contexts are driven by native exchange cancellation, not parented to
+a potentially older Go snapshot cache. GenerationContext scopes separate
+caller-owned background work. Native snapshots carry a monotonic revision;
+older observations cannot undo a stop or resurrect a retired Go context. The
+caller owns creation and joining of background goroutines.
+
+Each native transition reserves at most one coalesced state wake. Its credit is
+recycled only after delivery and lifecycle_result consumption. The newest state
+is returned, not a historical callback queue. Go Changes uses the same latest-
+state semantics and never executes user callbacks on the completion pump. These
+state watches cannot block lifecycle progress when the user does not read them.
+
+Lifecycle controls require the application name and a runtime-qualified `go`
+target. Private ApplicationEvents carry the action to other live instances with
+that same runtime/name through the existing notified fleet ring. Each reader
+owns a bounded cursor, ignores its locally applied records, and reports ring
+lag as failure. There is no periodic scan, invented timeout or replay at boot.
+The event cursor/readiness is prepared before Open returns. Its reader is owned
+by the application driver and is dropped before the lane ownership hold.
+
+A per-instance transition lock orders local actions and received decisions;
+there is no cross-node total order or synchronous sibling acknowledgement.
+New connections start at generation 1, matching the Java/JS initial-state model.
+Status reports use the existing application schema with actual running state
+and generation. An action or status publication error cannot roll back a token
+that has already been retired.
+
+Stop/restart is cooperative generation cancellation, not connection withdrawal
+or process termination. Shutdown keeps its existing drain semantics; Close
+explicitly cancels owned work. Public application-event subscriptions and
+edge-shutdown callbacks remain future work. Unsupported frames are counted and
+perform no action; one edge's shutdown does not cancel unrelated callers.
 
 ## Validation and cleanup
 
@@ -139,7 +185,10 @@ sleeps. Its Go fixture and actual Go example use the race detector; it can also 
 `GOEXPERIMENT=cgocheck2`. It checks real HTTP exchanges, concurrent instances,
 peer cancellation, handler failures, reply failures and graceful drain. It proves
 a full upload window makes a further write pending, transfers more than a window,
-closes pending reads, and drains the actual example after SIGTERM.
+closes pending reads, and drains the actual example after SIGTERM. Lifecycle fixtures use authoritative
+status rows as transition barriers, cover multiple Go processes and wrong targets,
+and keep old delayed handlers alive while new generations serve. The actual Go
+example is also stopped/restarted without changing its PID or lane.
 
 The external Python parent clears only the successful test's unique fleet,
 after the Rust caller and all Go children have exited. Failed runs retain their

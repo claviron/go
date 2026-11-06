@@ -21,6 +21,8 @@ func main() {
 		panic("usage: goapp <fleet> <name>")
 	}
 	gate := make(chan struct{})
+	lateGate := make(chan struct{})
+	var lateOnce sync.Once
 	panicGate := make(chan struct{})
 	var panicOnce sync.Once
 	var release sync.Once
@@ -35,6 +37,18 @@ func main() {
 		NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096, MaxRequestBytes: limit, MaxResponseBytes: limit},
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
+			case "/generation":
+				fmt.Fprint(w, orbitgo.Generation(r))
+				return
+			case "/late":
+				generation := orbitgo.Generation(r)
+				fmt.Printf("LATE %d\n", generation)
+				<-lateGate
+				if _, err := w.Write([]byte("late")); err == nil {
+					panic("retired handler published a response")
+				}
+				fmt.Printf("LATE_REJECTED %d\n", orbitgo.Generation(r))
+				return
 			case "/consume":
 				if _, err := io.Copy(io.Discard, r.Body); err != nil {
 					w.WriteHeader(413)
@@ -165,6 +179,37 @@ func main() {
 		scanner := bufio.NewScanner(os.Stdin)
 		for scanner.Scan() {
 			switch scanner.Text() {
+			case "watch":
+				ctx, err := app.GenerationContext()
+				if err != nil {
+					panic(err)
+				}
+				snapshot, err := app.Snapshot()
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("WATCH %d\n", snapshot.Generation)
+				go func(generation uint64) { <-ctx.Done(); fmt.Printf("GEN_CANCELLED %d\n", generation) }(snapshot.Generation)
+			case "release-late":
+				lateOnce.Do(func() { close(lateGate) })
+			case "start-api", "stop-api", "restart-api":
+				var err error
+				switch scanner.Text() {
+				case "start-api":
+					err = app.Start()
+				case "stop-api":
+					err = app.Stop()
+				case "restart-api":
+					err = app.Restart()
+				}
+				if err != nil {
+					panic(err)
+				}
+				snapshot, err := app.Snapshot()
+				if err != nil {
+					panic(err)
+				}
+				fmt.Printf("STATE %d %d %t\n", snapshot.Generation, snapshot.Revision, snapshot.Running)
 			case "panic":
 				panicOnce.Do(func() { close(panicGate) })
 			case "close-body":
