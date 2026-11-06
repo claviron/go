@@ -20,11 +20,8 @@ frames outside the supported lifecycle/status contract are counted by
 `UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
 This is unreleased source. The intended module path is
-`github.com/claviron/orbit-go`; no public Go release or native prebuild is
-available. The first implementation uses the current, unreleased Claviron Link
-application API. The manifest's Claviron version alone does not establish that
-the published package contains that API; source validation requires a matching
-checkout override until its release.
+`github.com/claviron/orbit-go`; no public Go release is available. It uses the
+Link application API of the published Claviron named in its manifest.
 
 ## Use from a Go application
 
@@ -291,6 +288,12 @@ live in ignored Cargo configuration. No local paths belong in the manifest.
 For downstream builds, link the matching native library with `CGO_LDFLAGS` and
 make it available to the platform loader; automated native distribution follows
 in a later stage.
+
+`scripts/release.py --prepare` builds one portable native library for this host
+into the ignored `prebuilds/`. `scripts/build-all.sh` does so for every host in
+the ignored `.hosts`: each builds the current commit in an isolated clone,
+fetching it first when needed, and its library is collected and verified here.
+Nothing is published by either.
 
 The acceptance driver builds ordinary Go fixtures and the actual plain/invoke
 Go examples, then exchanges requests with Claviron's real ApplicationClient. It covers repeated headers, encoded URI,
