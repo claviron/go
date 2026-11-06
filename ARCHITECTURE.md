@@ -15,12 +15,15 @@ in Go. The separate direct-integration Go FFI project is not a dependency.
 ## Sources
 
 - `application.go`: Go application ownership, completion pump and shutdown.
+- `invoke.go`: application-owned invoke admission, dispatch and drain.
+- `internal/native/invoke.go`: private invoke downcalls and retained-result copy-out.
+- `native/src/invoke/`: core Link driver, typed outcomes and checked invoke ABI.
 - `lifecycle.go`: authoritative snapshots, generation contexts and coalesced state wakes.
 - `http.go`: server request mapping, raw headers and handler dispatch.
 - `body.go`: lazy, serialized reads and concurrent input closure.
 - `internal/native/native.go`: private cgo calls and copy-out metadata.
 - `internal/httpadapter/response.go`: streaming response ownership and net/http behavior.
-- `internal/native/orbit_go.h`: ABI version three and ownership rules.
+- `internal/native/orbit_go.h`: ABI version four and ownership rules.
 - `native/src/abi.rs`: checked downcalls and unwind containment.
 - `native/src/registry.rs`: never-reused, kind-checked application/exchange handles.
 - `native/src/application.rs`: Link membership, frame dispatch and application drain.
@@ -109,7 +112,7 @@ The Link API supplies byte streams without a trailer envelope; trailers,
 informational responses, upgrades, hijacking and push are not advertised.
 
 The canonical ABI header is in internal/native so the Go package cache includes
-it. The binding checks v3 and fixed record sizes before opening; older bindings are incompatible.
+it. The binding checks v4 and fixed record sizes before opening; older bindings are incompatible.
 The ABI query record retains its original 56-byte extent so old callers can
 inspect the version before invoking any new record-taking function.
 
@@ -193,3 +196,68 @@ example is also stopped/restarted without changing its PID or lane.
 The external Python parent clears only the successful test's unique fleet,
 after the Rust caller and all Go children have exited. Failed runs retain their
 fleet for inspection; stop and verify all owners before any manual cleanup.
+
+## Application-owned invoke
+
+An invoke endpoint opens an independent Link fleet using the existing compiled
+Link geometry and Claviron invoke protocol. It never reads the HTTP inbox or
+adds HTTP frame variants. Parent admission serializes opening against shutdown;
+a native child reservation pins the application's runtime before setup begins.
+Failed setup returns the reservation. External handle release refuses a parent
+with retained invoke children. Each endpoint shares the native runtime's Handle;
+there is no additional Tokio runtime or Go process.
+
+One Go waiter owns the endpoint's completion queue. It dispatches incoming Go
+handlers and wakes outgoing callers, never executing user code in the pump.
+The queue reserves `3 * AcceptedCalls + PendingCalls + 2` slots: Request,
+Cancelled and Complete per retained incoming handle, Result per retained
+outgoing call, and Withdrawal/Closed barriers. Incoming credit is held through
+native completion delivery AND Go handler return; outgoing credit through result
+delivery and successful copy-out. No terminal event is dropped or blocked behind
+a full data queue. Monotonic process-local IDs are shared with the other ABI
+handle kinds; each endpoint checks its own incoming/outgoing maps.
+
+Opaque input bytes are copied before return, native outputs copied directly
+into Go-owned memory. Result queries borrow the retained native payload rather
+than cloning it. A too-small copy-out buffer does not consume result credit.
+Pending/accepted bounds and operation/request/response byte bounds are explicit,
+independent of HTTP. Zero payload bounds allow empty payloads only. Routes are
+immutable after startup. Core result codes preserve rejection bytes and
+OutcomeUnknown; no discovery policy, retry or timeout is added.
+
+Incoming work retains the native generation captured at acceptance. Cancelling
+that generation or explicitly closing the endpoint races its reply receiver,
+emits context cancellation and terminal completion, and prevents late replies.
+Go handler return alone does not release its handle before native completion.
+Outgoing work races the caller cancellation token, captured generation, endpoint
+cancel and core call. Cancelling interest drops only the local core future;
+remote execution is not rolled back. One terminal result is always delivered.
+HTTP, invoke and GenerationContext values carry an application/generation stamp
+through nested calls; native validation rejects a retired stamp even when Go
+cancellation was detached or its notification has not yet been consumed.
+
+Graceful application shutdown joins HTTP handlers before withdrawing invoke
+intake, preserving their nested calls. Invoke withdrawal sets an admission flag
+and enqueues its barrier under the same lock as incoming request publication.
+The Go pump reaches that barrier only after adding every accepted handler to
+its join set. It joins those handlers while the core driver stays running for
+their nested calls. Once handlers return, outgoing admission closes; all
+retained results/completions are consumed before the driver shutdown signal.
+The core driver then drains accepted result-stream writes and withdraws its own
+lane. Go joins callers/handlers before native endpoint release, then the parent
+can release its runtime. Closed endpoints leave the parent's ownership map.
+
+Explicit Close cancels endpoint tokens as well as withdrawing intake, but still
+joins cooperative handlers. Shutdown context expiry limits only the caller's
+wait. Neither operation unlinks a fleet, kills Go goroutines or supplies an
+implicit termination duration. Broken driver completion cancels/settles owned
+work and surfaces an error. Public application events remain a separate stage.
+
+The explicit acceptance harness drives an independent Rust invoke peer and
+HTTP caller against a normal Go fixture and the shipped Go invoke example.
+It checks typed/binary outcomes, panic/oversize results, pending capacity with
+HTTP progress, caller cancellation without rollback, generation cancellation in
+both directions, stopped refusal, late reply isolation, generation-stamp checks
+through WithoutCancel, HTTP/invoke nested drain, explicit Close and SIGTERM.
+All Go executables use the race detector; strict cgo checking is supported.
+Only the Python parent clears both exact test fleets, after every process exits.

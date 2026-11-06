@@ -97,3 +97,41 @@ pub fn remove_exchange(
 #[cfg(test)]
 #[path = "../tests/registry.rs"]
 mod tests;
+
+pub(crate) fn identity() -> Result<u64> {
+    registry().lock().map_err(|_| Status::Panic)?.identity()
+}
+
+// Reserve a child while the registry still pins the runtime. Application release
+// cannot pass its final ownership check between lookup and child attachment.
+pub(crate) struct InvokeReservation {
+    pub application: Arc<crate::application::State>,
+    committed: bool,
+}
+impl InvokeReservation {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for InvokeReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.application
+                .invoke_children
+                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+pub(crate) fn reserve_invoke(id: u64) -> Result<InvokeReservation> {
+    use std::sync::atomic::Ordering;
+    let registry = registry().lock().map_err(|_| Status::Panic)?;
+    let app =
+        &registry.applications.get(&id).ok_or(Status::InvalidHandle)?.state;
+    if app.stop.is_cancelled() || app.withdraw.is_cancelled() {
+        return Err(Status::Closed);
+    }
+    app.invoke_children
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+        .map_err(|_| Status::Capacity)?;
+    Ok(InvokeReservation { application: Arc::clone(app), committed: false })
+}

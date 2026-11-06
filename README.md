@@ -14,7 +14,8 @@ the request is still arriving. Read and output operations have independent
 native owners and bounded buffers.
 
 Application status uses Claviron's existing schema. Application start/stop/restart and generation cancellation are supported.
-Public event subscriptions and invoke remain later stages. Unsupported management/event
+Application-owned invoke is implemented on a separate Link, sharing the same
+Go process and native I/O runtime. Public event subscriptions remain a later stage. Unsupported management/event
 frames outside the supported lifecycle/status contract are counted by
 `UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
@@ -171,10 +172,98 @@ The Go example also exposes `GET /generation` and `GET /wait-generation`:
 the latter flushes a head and waits for its request generation to be cancelled.
 No lifecycle operation restarts the example's Go process.
 
+## Invoke on a separate Link
+
+`app.OpenInvocations` attaches a service to the application's lifecycle. It uses
+an independent fleet from HTTP, with Claviron's existing invoke protocol and
+caller-reserved result streams. There is no second Go executable, embedded Go
+runtime or framework dependency. HTTP uses `http.Handler`; invoke uses its own
+`InvokeHandler` and opaque operation/payload values.
+
+```go
+calls, err := app.OpenInvocations(orbitgo.InvokeOptions{
+    Fleet: "ex-rpc", Service: "go-service",
+    PendingCalls: 32, AcceptedCalls: 32,
+    OperationBytes: 64, RequestBytes: 4096, ResponseBytes: 65536,
+    Routes: map[string]string{"peer": "peer-service"},
+}, func(ctx context.Context, request orbitgo.Invocation) orbitgo.InvokeResult {
+    if ctx.Err() != nil {
+        return orbitgo.InvokeResult{Code: orbitgo.InvokeRemoteClosing}
+    }
+    if request.Operation != "echo" {
+        return orbitgo.InvokeResult{Code: orbitgo.InvokeUnsupported}
+    }
+    return orbitgo.InvokeResult{Payload: request.Payload}
+})
+if err != nil { panic(err) }
+
+// Use the HTTP request context inside an HTTP handler, or an owned generation
+// context for background work. The target is a registered logical name.
+ctx, err := app.GenerationContext()
+if err != nil { panic(err) }
+result, err := calls.Call(ctx, "peer", "echo", []byte("hello"))
+if err != nil { /* local cancellation, capacity or binding failure */ }
+if err == nil && result.Code == orbitgo.InvokeSuccess {
+    _ = result.Payload
+}
+```
+
+Prepare captured handler state before opening: dispatch can begin before the
+open call returns. Routes are copied at open and then immutable. A missing or
+ambiguous service returns its typed result; the binding does not select a peer
+or retry. `InvokeOutcomeUnknown` means execution may have happened and is never
+permission to retry automatically. Rejected domain bytes stay separate from
+transport errors. Handlers may return Success, RemoteBusy, RemoteClosing,
+Unsupported, ResponseTooLarge or Rejected. A panic becomes an empty Rejected;
+an oversized response becomes ResponseTooLarge.
+
+PendingCalls bounds retained outgoing calls; AcceptedCalls bounds retained
+incoming handlers, including cancelled handlers that have not returned.
+OperationBytes is positive; zero request/response byte bounds allow only empty
+payloads. Bounds must fit the compiled Link geometry. These are independent of
+HTTP admission/body limits. One native completion waiter serves each invoke
+endpoint; individual calls park Go goroutines rather than one cgo thread per
+call. Inputs are copied before asynchronous retention; no Go pointer is retained.
+
+Caller context cancellation withdraws local interest and consumes its native
+completion before returning. It does not cancel or roll back accepted remote
+work. An invocation captures one immutable application generation; stop/restart
+cancels its context, pending outbound calls and native reply eligibility. Late
+handler results cannot answer another generation. HTTP, invoke and generation
+contexts also carry their native owner and generation into nested calls; even
+`context.WithoutCancel` cannot grant retired work a newer generation. A plain
+independent context captures the current generation at submission.
+
+Application Shutdown first withdraws HTTP and joins accepted HTTP handlers while
+invoke remains usable for their nested calls. It then withdraws invoke intake,
+joins accepted invoke handlers and their nested calls, and drains the core
+result streams before releasing the application runtime. New invoke requests
+receive RemoteClosing during this drain. Closing an endpoint explicitly cancels
+its owned calls/handlers without closing HTTP. Application Close cancels both.
+A handler must return cooperatively; no implicit deadline or forced termination
+is installed. Do not synchronously wait for your own endpoint/application to
+shut down from inside its handler: the owner joins that handler.
+
+`calls.Shutdown(ctx)` starts endpoint drain; expiring ctx ends only the wait.
+`calls.Done()` closes after native release and handler/caller joins. Closed
+endpoints release their application ownership and can be replaced without
+retaining old handlers for the application's lifetime.
+
+See [the complete invoke example](examples/invoke/main.go). Its `/invoke` HTTP
+route calls a peer service, while its invoke handler serves `echo` concurrently:
+
+```sh
+python3 scripts/build.py --claviron-source /path/to/claviron -- run ./examples/invoke \
+  --fleet example --invoke-fleet ex-rpc --service go-service --peer peer-service
+```
+
+The operator supplies the separate peer service. Invocations are a trusted
+same-host Link capability; domain authorization belongs in the handler.
+
 ## ABI migration
 
-ABI v3 adds generation metadata, lifecycle actions, snapshots and a coalesced
-lifecycle notification to v2 streaming operations. Rebuild the Go package and
+ABI v4 adds separate invoke owners, retained call/handler handles and signalled
+completion delivery to v3 lifecycle/streaming operations. Rebuild the Go package and
 its matching native library together. Older bindings are rejected before joining;
 the version-query record keeps its original extent so they can query safely. Go
 callers must now supply `IOBufferBytes`; zero total body limits mean unlimited
@@ -187,7 +276,7 @@ Requirements: Go with cgo and a C compiler, Rust 1.98 or newer, Python 3 and a
 matching Claviron source checkout. The Go language baseline is 1.23; initial
 validation used Go 1.27.3 and Rust 1.99.1 on Linux x86-64. Other platforms have
 not been validated. The explicit acceptance driver also needs the `orbit` CLI
-for cleanup of its isolated test fleet.
+for cleanup of its isolated HTTP and invoke test fleets.
 
 ```sh
 python3 scripts/build.py --claviron-source /path/to/claviron -- test -race ./...
@@ -203,8 +292,8 @@ For downstream builds, link the matching native library with `CGO_LDFLAGS` and
 make it available to the platform loader; automated native distribution follows
 in a later stage.
 
-The acceptance driver builds both a normal Go fixture and the actual plain Go
-example, then exchanges requests with Claviron's real ApplicationClient. It covers repeated headers, encoded URI,
+The acceptance driver builds ordinary Go fixtures and the actual plain/invoke
+Go examples, then exchanges requests with Claviron's real ApplicationClient. It covers repeated headers, encoded URI,
 addresses, bounded bodies, HEAD, concurrent application instances, cancellation,
 handler panic before/after commit, failed reply publication and graceful drain.
 It fills the upload window and proves the next write is pending, transfers bodies
@@ -213,8 +302,13 @@ sends SIGTERM to the actual Go example during a streaming response. Lifecycle
 acceptance verifies two-instance fan-out, wrong-target isolation, generation
 context cancellation, delayed old handlers, Go lifecycle APIs and unchanged
 process/lane ownership. The actual Go example is stopped, started and restarted
-through real Claviron control frames. It stops its own
-processes before clearing its unique fleet and preserves failed fleets for
+through real Claviron control frames. Invoke acceptance verifies binary/rejected
+payloads, typed failures, bounded pending calls with concurrent HTTP progress,
+local cancellation without remote rollback, generation retirement and late
+results, nested calls during HTTP and invoke drain, explicit Close, and the
+shipped invoke example in both directions. Go programs run with the race
+detector; use `GOEXPERIMENT=cgocheck2` for strict cgo pointer checking. It stops
+its own processes before clearing its unique fleets and preserves failed fleets for
 inspection. No production listener or load benchmark is involved.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md), [the ABI header](internal/native/orbit_go.h)

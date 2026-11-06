@@ -49,6 +49,8 @@ type Application struct {
 	done              chan struct{}
 	err               error
 	terminal          bool
+	shutting          bool
+	invocations       map[*Invocations]struct{}
 	lifecycle         Snapshot
 	generationContext context.Context
 	generationCancel  context.CancelFunc
@@ -93,6 +95,7 @@ func (a *Application) Shutdown(ctx context.Context) error {
 		return fmt.Errorf("orbit-go: nil shutdown context")
 	}
 	a.mu.Lock()
+	a.shutting = true
 	if !a.terminal {
 		if err := native.Withdraw(a.handle); err != nil {
 			a.mu.Unlock()
@@ -113,16 +116,21 @@ func (a *Application) Shutdown(ctx context.Context) error {
 // cannot be forcibly terminated. It never exits the process or unlinks a fleet.
 func (a *Application) Close() error {
 	a.mu.Lock()
+	a.shutting = true
+	children := a.invokeChildren()
+	if a.generationCancel != nil {
+		a.generationCancel()
+	}
 	if !a.terminal {
-		if a.generationCancel != nil {
-			a.generationCancel()
-		}
 		_ = native.Cancel(a.handle)
 		for _, exchange := range a.active {
 			exchange.cancel()
 		}
 	}
 	a.mu.Unlock()
+	for _, child := range children {
+		child.beginShutdown(true)
+	}
 	<-a.done
 	return a.Err()
 }
@@ -168,7 +176,7 @@ func (a *Application) pump() {
 		switch event.Kind {
 		case 1:
 			request, err := native.ReadRequest(event.Exchange)
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := context.WithCancel(generationContext(a.handle, request.Generation))
 			if request.Cancelled {
 				cancel()
 			}
@@ -195,9 +203,8 @@ func (a *Application) pump() {
 		case 4:
 			a.mu.Lock()
 			a.terminal = true
-			if a.generationCancel != nil {
-				a.generationCancel()
-			}
+			a.shutting = true
+			children := a.invokeChildren()
 			if event.Status != 0 {
 				a.setError(native.Status(event.Status))
 			}
@@ -207,7 +214,19 @@ func (a *Application) pump() {
 			a.mu.Unlock()
 			a.workers.Wait()
 			a.ioWorkers.Wait()
+			for _, child := range children {
+				child.beginShutdown(false)
+			}
+			for _, child := range children {
+				<-child.Done()
+				a.mu.Lock()
+				a.setError(child.Err())
+				a.mu.Unlock()
+			}
 			a.mu.Lock()
+			if a.generationCancel != nil {
+				a.generationCancel()
+			}
 			a.setError(native.Release(a.handle))
 			a.mu.Unlock()
 			close(a.changes)
@@ -306,4 +325,14 @@ func (a *Application) closeRead(id native.Handle) error {
 		return nil
 	}
 	return native.CloseRead(id)
+}
+
+// invokeChildren snapshots under a.mu; closed endpoints are removed rather than
+// retaining their handlers for the rest of the application's lifetime.
+func (a *Application) invokeChildren() []*Invocations {
+	children := make([]*Invocations, 0, len(a.invocations))
+	for child := range a.invocations {
+		children = append(children, child)
+	}
+	return children
 }

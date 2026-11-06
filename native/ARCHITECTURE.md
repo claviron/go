@@ -14,3 +14,9 @@ slots and terminal exchange completion.
 
 Dependencies enter through the public `claviron` facade. No internal Claviron
 crate path, embedded Go runtime or second SHM protocol belongs here.
+
+`invoke/mod.rs` owns application-child reservations, separate Link drivers,
+bounded incoming/outgoing records, generation capture and signalled drain.
+`invoke/outcome.rs` maps the existing typed protocol outcomes.
+`invoke/ffi.rs` implements ABI v4 invoke records and checked copy-out calls.
+The original 56-byte ABI query record remains unchanged.

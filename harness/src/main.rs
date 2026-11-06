@@ -1,4 +1,5 @@
 //! Isolated real-Link caller. The application under test is a Go executable.
+mod invoke;
 mod lifecycle;
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -507,6 +508,15 @@ async fn main() -> Result<()> {
         .ok_or("Go example binary is required")?
         .into();
     run(binary, example, &fleet).await?;
+    let invoke_binary = std::env::args_os()
+        .nth(4)
+        .ok_or("invoke fixture binary required")?
+        .into();
+    let invoke_fleet =
+        std::env::args().nth(5).ok_or("invoke fleet required")?;
+    let invoke_example =
+        std::env::args_os().nth(6).ok_or("invoke example required")?.into();
+    invoke::run(&invoke_binary, &invoke_example, &fleet, &invoke_fleet).await?;
     println!("Application acceptance passed");
     Ok(())
 }

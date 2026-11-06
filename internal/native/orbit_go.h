@@ -4,7 +4,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 3. Inputs live only for the call; native never retains Go pointers.
+/* ABI 4. Inputs live only for the call; native never retains Go pointers.
  * Outputs must be aligned and writable. Copy-out buffers may not overlap inputs.
  * Status: 0 OK, 1 invalid argument, 2 stale/wrong-kind handle, 3 closed,
  * 4 capacity, 5 unsupported, 6 transport, 7 contained panic, 8 busy, 9 cancelled, 10 body limit.
@@ -66,6 +66,28 @@ uint32_t og_read_result(uint64_t exchange, uint8_t *out, uint64_t capacity, uint
 uint32_t og_read_close(uint64_t exchange);
 uint32_t og_exchange_cancel(uint64_t exchange);
 uint32_t og_exchange_release(uint64_t app, uint64_t exchange);
+/* Invoke is a separate application-owned Link, sharing the application's I/O
+ * runtime. One invoke waiter; events: 1 request, 2 cancelled, 3 complete,
+ * 4 intake withdrawn (barrier), 5 call result, 6 closed.
+ * Retain incoming handles until handler return AND complete delivery. Retain
+ * outgoing handles until result delivery/copy-out. No Go input is retained.
+ * Withdraw closes incoming admission; finish follows all handler/call joins.
+ */
+typedef struct { uint64_t pending_calls, accepted_calls, operation_bytes, request_bytes, response_bytes; } og_invoke_options;
+typedef struct { uint64_t generation, cancelled; } og_invoke_info;
+uint32_t og_invoke_open(uint64_t app, const uint8_t *fleet, uint64_t fleet_len, const uint8_t *service, uint64_t service_len, const uint8_t *routes, uint64_t routes_len, const og_invoke_options *options, uint64_t *out);
+uint32_t og_invoke_wait(uint64_t owner, og_event *out);
+uint32_t og_invoke_withdraw(uint64_t owner);
+uint32_t og_invoke_cancel(uint64_t owner);
+uint32_t og_invoke_finish(uint64_t owner);
+uint32_t og_invoke_release(uint64_t owner);
+uint32_t og_invocation_info(uint64_t owner, uint64_t id, og_invoke_info *out);
+uint32_t og_invocation_copy(uint64_t owner, uint64_t id, uint32_t field, uint8_t *out, uint64_t capacity, uint64_t *length);
+uint32_t og_invocation_reply(uint64_t owner, uint64_t id, uint32_t code, const uint8_t *payload, uint64_t length);
+uint32_t og_invocation_release(uint64_t owner, uint64_t id);
+uint32_t og_call_start(uint64_t owner, uint64_t expected_generation, const uint8_t *target, uint64_t target_len, const uint8_t *operation, uint64_t operation_len, const uint8_t *payload, uint64_t payload_len, uint64_t *out, og_invoke_info *info);
+uint32_t og_call_cancel(uint64_t owner, uint64_t id);
+uint32_t og_call_result(uint64_t owner, uint64_t id, uint32_t *code, uint32_t *status, uint8_t *out, uint64_t capacity, uint64_t *length, uint32_t consume);
 #ifdef __cplusplus
 }
 #endif

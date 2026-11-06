@@ -29,7 +29,7 @@ pub struct Application {
 }
 
 pub struct State {
-    options: Options,
+    pub(crate) options: Options,
     segment: Arc<ApplicationSegment>,
     bodies: ApplicationBodies,
     lane: usize,
@@ -47,6 +47,8 @@ pub struct State {
     pub lifecycle: lifecycle::Lifecycle,
     events: Arc<events::Events>,
     transition: Mutex<()>,
+    pub(crate) host: tokio::runtime::Handle,
+    pub(crate) invoke_children: AtomicUsize,
 }
 
 pub use io::Exchange;
@@ -103,6 +105,8 @@ impl Application {
             let lifecycle = lifecycle::Lifecycle::new(stop.clone());
             Ok((
                 Arc::new(State {
+                    host: runtime.handle().clone(),
+                    invoke_children: AtomicUsize::new(0),
                     options,
                     segment,
                     bodies,
@@ -168,6 +172,7 @@ impl State {
         self.closed.load(Ordering::Acquire)
             && self.delivered.load(Ordering::Acquire)
             && self.retained.load(Ordering::Acquire) == 0
+            && self.invoke_children.load(Ordering::Acquire) == 0
     }
 
     pub fn release_credit(&self) {

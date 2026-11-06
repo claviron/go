@@ -5,6 +5,19 @@ import (
 	"github.com/claviron/orbit-go/internal/native"
 )
 
+// A handler context carries its native owner as well as its generation. This
+// survives context.WithoutCancel: detaching a Go deadline must not grant an old
+// handler admission to a newer native generation.
+type generationContextKey struct{}
+type generationOwner struct {
+	application native.Handle
+	generation  uint64
+}
+
+func generationContext(app native.Handle, generation uint64) context.Context {
+	return context.WithValue(context.Background(), generationContextKey{}, generationOwner{app, generation})
+}
+
 // Snapshot describes the local application, independently of its connection.
 // Revision orders observed state changes; Generation identifies accepted work.
 type Snapshot struct {
@@ -22,7 +35,7 @@ func (a *Application) syncLifecycle(value native.LifecycleState) {
 		a.generationCancel()
 	}
 	if value.Generation != a.lifecycle.Generation {
-		a.generationContext, a.generationCancel = context.WithCancel(context.Background())
+		a.generationContext, a.generationCancel = context.WithCancel(generationContext(a.handle, value.Generation))
 	}
 	if !value.Running {
 		a.generationCancel()

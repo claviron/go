@@ -1,4 +1,4 @@
-//! C ABI version three: checked handles, borrowed call inputs and copy-out data.
+//! C ABI version four: checked handles, borrowed call inputs and copy-out data.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -115,7 +115,7 @@ pub struct RequestInfo {
     pub reserved: u32,
 }
 
-fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
+pub(crate) fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
     match catch_unwind(AssertUnwindSafe(action)) {
         Ok(Ok(())) => Status::Ok as u32,
         Ok(Err(status)) => status as u32,
@@ -123,7 +123,7 @@ fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
     }
 }
 
-unsafe fn bytes<'a>(
+pub(crate) unsafe fn bytes<'a>(
     data: *const u8,
     length: u64,
 ) -> Result<&'a [u8]> {
@@ -139,7 +139,7 @@ unsafe fn bytes<'a>(
     Ok(unsafe { std::slice::from_raw_parts(data, length) })
 }
 
-unsafe fn output<T>(
+pub(crate) unsafe fn output<T>(
     out: *mut T,
     value: T,
 ) -> Result<()> {
@@ -151,7 +151,7 @@ unsafe fn output<T>(
     Ok(())
 }
 
-unsafe fn copy_out(
+pub(crate) unsafe fn copy_out(
     value: &[u8],
     out: *mut u8,
     capacity: u64,
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {
         output(
             out,
             Abi {
-                version: 3,
+                version: 4,
                 event_size: size_of::<Event>() as u32,
                 options_size: size_of::<OpenOptions>() as u32,
                 info_size: size_of::<RequestInfo>() as u32,
@@ -221,7 +221,7 @@ pub unsafe extern "C" fn og_open(
             out.write(0);
         }
         let options = unsafe { &*options };
-        if options.abi_version != 3 {
+        if options.abi_version != 4 {
             return Err(Status::Unsupported);
         }
         let fleet = std::str::from_utf8(unsafe { bytes(fleet, fleet_len)? })

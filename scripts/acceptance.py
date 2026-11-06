@@ -23,12 +23,18 @@ command += ['--', 'build', '-race', '-o', str(fixture), './harness/goapp']
 subprocess.run(command, cwd=root, check=True)
 example = target / 'plain-example'
 subprocess.run(command[:-2] + [str(example), './examples/plain'], cwd=root, check=True)
+invoke_fixture = target / 'invoke-goapp'
+subprocess.run(command[:-2] + [str(invoke_fixture), './harness/invokeapp'], cwd=root, check=True)
+invoke_example = target / 'invoke-example'
+subprocess.run(command[:-2] + [str(invoke_example), './examples/invoke'], cwd=root, check=True)
+invoke_fleet = 'i' + secrets.token_hex(4)[:7]
 fleet = 'g' + secrets.token_hex(4)[:7]
-result = subprocess.run([str(target / 'debug/orbit-go-acceptance'), str(fixture), fleet, str(example)], cwd=root)
+result = subprocess.run([str(target / 'debug/orbit-go-acceptance'), str(fixture), fleet, str(example), str(invoke_fixture), invoke_fleet, str(invoke_example)], cwd=root)
 if result.returncode:
-    print(f'Acceptance failed: retain fleet {fleet} for inspection; stop all owners before cleanup.', file=sys.stderr)
+    print(f'Acceptance failed: retain fleets {fleet} and {invoke_fleet} for inspection; stop all owners before cleanup.', file=sys.stderr)
     sys.exit(result.returncode)
 # Both Go children were explicitly joined and the Rust caller has exited.
 # No process owned by this harness retains any mapping at this point.
-subprocess.run(['orbit', 'clear', fleet, '--all', '--yes'], check=True)
+for owned_fleet in (fleet, invoke_fleet):
+    subprocess.run(['orbit', 'clear', owned_fleet, '--all', '--yes'], check=True)
 print('All acceptance processes exited; isolated fleet cleaned.')

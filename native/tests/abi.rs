@@ -4,7 +4,7 @@ use super::*;
 fn abi_layout_and_invalid_arguments_are_explicit() {
     let mut abi = Abi::default();
     assert_eq!(unsafe { og_abi(&mut abi) }, 0);
-    assert_eq!(abi.version, 3);
+    assert_eq!(abi.version, 4);
     assert_eq!(abi.event_size as usize, size_of::<Event>());
     assert_eq!(
         unsafe { og_abi(ptr::null_mut()) },

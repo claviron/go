@@ -62,10 +62,10 @@ func Open(o Options) (Handle, uint64, error) {
 	if err := check(C.og_abi(&abi)); err != nil {
 		return 0, 0, err
 	}
-	if abi.version != 3 || uintptr(abi.event_size) != unsafe.Sizeof(C.og_event{}) || uintptr(abi.options_size) != unsafe.Sizeof(C.og_options{}) || uintptr(abi.info_size) != unsafe.Sizeof(C.og_request_info_record{}) {
+	if abi.version != 4 || uintptr(abi.event_size) != unsafe.Sizeof(C.og_event{}) || uintptr(abi.options_size) != unsafe.Sizeof(C.og_options{}) || uintptr(abi.info_size) != unsafe.Sizeof(C.og_request_info_record{}) {
 		return 0, 0, fmt.Errorf("orbit-go: incompatible native ABI")
 	}
-	opts := C.og_options{abi_version: 3, native_threads: C.uint32_t(o.NativeThreads), incarnation: C.uint64_t(o.Incarnation), max_exchanges: C.uint64_t(o.MaxExchanges), max_request_bytes: C.uint64_t(o.MaxRequestBytes), max_response_bytes: C.uint64_t(o.MaxResponseBytes), io_buffer_bytes: C.uint64_t(o.IOBufferBytes)}
+	opts := C.og_options{abi_version: 4, native_threads: C.uint32_t(o.NativeThreads), incarnation: C.uint64_t(o.Incarnation), max_exchanges: C.uint64_t(o.MaxExchanges), max_request_bytes: C.uint64_t(o.MaxRequestBytes), max_response_bytes: C.uint64_t(o.MaxResponseBytes), io_buffer_bytes: C.uint64_t(o.IOBufferBytes)}
 	var handle, lane C.uint64_t
 	err := check(C.og_open(stringData(o.Fleet), C.uint64_t(len(o.Fleet)), stringData(o.Name), C.uint64_t(len(o.Name)), &opts, &handle))
 	runtime.KeepAlive(o)
