@@ -23,7 +23,7 @@ func main() {
 	drain := make(chan struct{})
 	httpGate := make(chan struct{})
 	var lateOnce, drainOnce, httpOnce sync.Once
-	app, err := orbit.Open(orbit.Options{Fleet: os.Args[1], Name: "app", Incarnation: 1, NativeThreads: 1, MaxExchanges: 8, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	app, err := orbit.Open(orbit.Options{Fleet: os.Args[1], Name: "app", Incarnation: 1, NativeThreads: 1, MaxInFlight: 8, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-PID", fmt.Sprint(os.Getpid()))
 		if r.URL.Path == "/hold-invoke" {
 			w.WriteHeader(200)

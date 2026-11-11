@@ -21,9 +21,10 @@ in Go. The separate direct-integration Go FFI project is not a dependency.
 - `lifecycle.go`: authoritative snapshots, generation contexts and coalesced state wakes.
 - `http.go`: server request mapping, raw headers and handler dispatch.
 - `body.go`: lazy, serialized reads and concurrent input closure.
+- `session.go`: WebSocket and WebTransport acceptance and whole-message I/O.
 - `internal/native/native.go`: private cgo calls and copy-out metadata.
 - `internal/httpadapter/response.go`: streaming response ownership and net/http behavior.
-- `internal/native/claviron_go.h`: ABI version four and ownership rules.
+- `internal/native/claviron_go.h`: ABI version six and ownership rules.
 - `native/src/abi.rs`: checked downcalls and unwind containment.
 - `native/src/registry.rs`: never-reused, kind-checked application/exchange handles.
 - `native/src/application.rs`: Link membership, frame dispatch and application drain.
@@ -48,7 +49,11 @@ the application, not one per request. It dispatches requests to Go goroutines;
 it never executes user handlers. Native read/write work returns by terminal
 events, rather than by blocking a handler in cgo for the duration of I/O.
 
-`MaxExchanges` bounds retained exchange handles. Each credit reserves Request,
+`MaxInFlight` bounds retained exchange handles. `MaxQueued` counts waiting
+exchanges, with zero selecting direct intake. The receiver publishes their sum
+as its admission window and `MaxInFlight` as its execution limit. `WorkQueue`
+promotes waiting exchanges after the last owner releases the execution credit.
+Each started exchange reserves Request,
 Cancelled, Complete and at most one unconsumed Read result and Output result;
 two additional queue slots belong to Closed and a coalesced lifecycle wake. Each direction admits one operation
 at a time. A result becomes reusable only after its event has been delivered AND
@@ -59,7 +64,8 @@ remain queued. No terminal completion is discarded or waits for data-queue space
 Go pins an exchange for each operation through native result consumption. Release
 requires native completion, handler return and zero Go I/O leases. Application
 closure joins handlers and I/O consumers before releasing the native runtime.
-Full exchange admission sends an empty 503 without evicting an older exchange.
+Callers wait on the shared receiver budget; local lifecycle refusals still send
+an empty 503 without evicting an older exchange.
 
 Read and output use separate native actors and command slots. The input owner
 reads only on Go demand, at most IOBufferBytes, and reuses its buffer. Its result
@@ -112,7 +118,7 @@ The Link API supplies byte streams without a trailer envelope; trailers,
 informational responses, upgrades, hijacking and push are not advertised.
 
 The canonical ABI header is in internal/native so the Go package cache includes
-it. The binding checks v4 and fixed record sizes before opening; older bindings are incompatible.
+it. The binding checks v6 and fixed record sizes before opening; older bindings are incompatible.
 The ABI query record retains its original 56-byte extent so old callers can
 inspect the version before invoking any new record-taking function.
 
@@ -261,3 +267,25 @@ both directions, stopped refusal, late reply isolation, generation-stamp checks
 through WithoutCancel, HTTP/invoke nested drain, explicit Close and SIGTERM.
 All Go executables use the race detector; strict cgo checking is supported.
 Only the Python parent clears both exact test fleets, after every process exits.
+
+## Receiver admission
+
+The native application advertises its existing retained-exchange budget through
+Link admission. Callers reserve shared target capacity before opening a body
+stream. Intake uses `ApplicationReceiver` and `accept_frame`; saturation does not
+pause management/event reception. A validated ticket stays with the exchange
+through I/O completion and foreign-handle release. The retained-exchange budget
+is the total admission window (running work included), not an additional queue. It is positive and strictly below
+`LINK_INBOX_CAPACITY`, leaving inbox space for control frames. These bindings do
+not declare a separate, lower execution limit.
+
+Request payload location is independent of the duplex cancellation/session
+stream: inline payloads are read from their decoded frame slice, streamed payloads
+from the input half. Replies declare their own payload location.
+
+Status queries reply to the asking Edge lane; lifecycle changes still broadcast
+to connected Edges. Response heads use `ApplicationSegment::publish_reply`. If
+producer records are busy, only that exchange's output owner waits on
+`record_released`, retaining its admission and bridge credits. Cancellation and
+HTTP reader departure interrupt that wait; intake and event/control readers keep
+running. Refusals issued by intake remain best-effort and never wait for records.

@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use claviron::orbit::link::application::{
-    ApplicationBodies, ApplicationSegment, ControlCommand, Exchange as Frame,
-    ExchangeReply, FrameKind, Headers, Received, ShutdownNotice, frame_kind,
+    ApplicationBodies, ApplicationReceiver, ApplicationSegment, ControlCommand,
+    Exchange as Frame, ExchangeReply, FrameKind, Headers, Offered, Received,
+    ShutdownNotice, Start, WorkQueue, frame_kind,
 };
-use claviron::orbitive::link::InboxReceiver;
 use claviron::orbitive::shm::LaneHold;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
@@ -39,6 +39,7 @@ pub struct State {
     pub stop: CancellationToken,
     pub withdraw: CancellationToken,
     retained: AtomicUsize,
+    released: Option<Releases>,
     running: AtomicUsize,
     changed: Notify,
     closed: AtomicBool,
@@ -52,10 +53,28 @@ pub struct State {
 }
 
 pub use io::Exchange;
+pub(crate) use io::{MESSAGE_BINARY, MESSAGE_CLOSE, MESSAGE_TEXT};
+
+#[derive(Default)]
+struct Releases {
+    count: AtomicUsize,
+    changed: Notify,
+}
+
+impl Releases {
+    fn record(&self) {
+        self.count.fetch_add(1, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    fn take(&self) -> usize {
+        self.count.swap(0, Ordering::AcqRel)
+    }
+}
 
 impl Application {
     pub fn open(options: Options) -> Result<Self> {
-        options.validate()?;
+        let window = options.validate()?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(options.native_threads)
             .enable_all()
@@ -67,11 +86,19 @@ impl Application {
                     .map_err(|_| Status::Transport)?,
             );
             let joined = segment
-                .join(&options.name, "go", options.incarnation)
+                .join_with_capacity(
+                    &options.name,
+                    "go",
+                    options.incarnation,
+                    Some(window),
+                )
                 .map_err(|_| Status::Transport)?;
             // Own the lane immediately, including fallible body/reader setup.
             let hold = joined.hold;
             let setup = (|| {
+                segment
+                    .set_work_execution(joined.lane, options.max_in_flight)
+                    .map_err(|_| Status::Transport)?;
                 let bodies = ApplicationBodies::for_segment(
                     &segment,
                     joined.lane,
@@ -80,7 +107,7 @@ impl Application {
                 .map_err(|_| Status::Transport)?;
                 bodies.reclaimed(&joined.reclaimed);
                 let receiver = segment
-                    .receiver(joined.lane)
+                    .application_receiver(joined.lane)
                     .map_err(|_| Status::Transport)?;
                 let (events, event_reader) = events::Events::open(
                     &options.fleet,
@@ -100,13 +127,14 @@ impl Application {
             // one read and one output result. The extra slot belongs to Closed.
             // Admission credits are retained until explicit exchange release.
             let (send, receive) =
-                mpsc::sync_channel(options.max_exchanges * 5 + 2);
+                mpsc::sync_channel(options.max_in_flight * 5 + 2);
             let stop = CancellationToken::new();
             let lifecycle = lifecycle::Lifecycle::new(stop.clone());
             Ok((
                 Arc::new(State {
                     host: runtime.handle().clone(),
                     invoke_children: AtomicUsize::new(0),
+                    released: (options.max_queued > 0).then(Releases::default),
                     options,
                     segment,
                     bodies,
@@ -177,6 +205,13 @@ impl State {
 
     pub fn release_credit(&self) {
         self.retained.fetch_sub(1, Ordering::AcqRel);
+        self.work_finished();
+    }
+
+    fn work_finished(&self) {
+        if let Some(released) = &self.released {
+            released.record();
+        }
     }
 
     fn event(
@@ -198,15 +233,33 @@ impl State {
 
     async fn drive(
         self: &Arc<Self>,
-        mut receiver: InboxReceiver,
+        mut receiver: ApplicationReceiver,
         mut events: events::Reader,
     ) -> Status {
         let mut bytes = Vec::new();
+        let mut work = self.released.as_ref().map(|_| WorkQueue::new());
         let outcome = loop {
             let received = tokio::select! {
                 biased;
                 () = self.stop.cancelled() => break Status::Ok,
                 () = self.withdraw.cancelled() => break Status::Ok,
+                () = async {
+                    match &self.released {
+                        Some(released) => released.changed.notified().await,
+                        None => std::future::pending().await,
+                    }
+                }, if work.is_some() => {
+                    let finished = self.released.as_ref().expect("queued admission").take();
+                    let work = work.as_mut().expect("queued admission");
+                    for _ in 0..finished {
+                        if let Some(start) = work.finished(&self.segment, self.lane)
+                            && let Err(error) = self.start(start).await
+                        {
+                            return error;
+                        }
+                    }
+                    continue;
+                }
                 action = events.next() => {
                     match action.and_then(|action| self.apply_from_ring(action)) {
                         Ok(()) => continue,
@@ -216,7 +269,7 @@ impl State {
                 received = receiver.next(&mut bytes) => received,
             };
             match received {
-                Ok(Received::Directory(_)) => continue,
+                Ok(Received::Directory(_) | Received::Capacity(_)) => continue,
                 // Stage one has no registered application-event codec. Do not
                 // consume events or management commands as successful HTTP work.
                 Ok(Received::Event) => {
@@ -224,8 +277,58 @@ impl State {
                     continue;
                 }
                 Err(_) => break Status::Transport,
-                Ok(Received::Frame) => {}
+                Ok(Received::Frame | Received::Work(_)) => {}
             }
+            if matches!(frame_kind(&bytes), Ok(FrameKind::Request)) {
+                let offered = match &mut work {
+                    Some(work) => work.offer(
+                        &self.segment,
+                        self.lane,
+                        received.unwrap(),
+                        &mut bytes,
+                    ),
+                    None => self
+                        .segment
+                        .accept_frame(self.lane, received.unwrap(), &bytes)
+                        .map(|admission| {
+                            Offered::Start((
+                                std::mem::take(&mut bytes),
+                                admission,
+                            ))
+                        }),
+                };
+                match offered {
+                    Ok(Offered::Start(start)) => {
+                        if let Err(error) = self.start(start).await {
+                            break error;
+                        }
+                    }
+                    Ok(Offered::Held) => {}
+                    Err(_) => {
+                        if let Ok(frame) = Frame::decode(
+                            tokio_util::bytes::Bytes::copy_from_slice(&bytes),
+                        ) {
+                            self.refuse(frame, 503).await;
+                        }
+                    }
+                }
+                continue;
+            }
+            let _admission = match self.segment.accept_frame(
+                self.lane,
+                received.unwrap(),
+                &bytes,
+            ) {
+                Ok(admission) => admission,
+                Err(_) => {
+                    if let Ok(frame) = Frame::decode(
+                        tokio_util::bytes::Bytes::copy_from_slice(&bytes),
+                    ) {
+                        self.refuse(frame, 503).await;
+                    }
+                    continue;
+                }
+            };
             match frame_kind(&bytes) {
                 Ok(FrameKind::Request) => {}
                 Ok(FrameKind::Control) => {
@@ -237,7 +340,9 @@ impl State {
                         && command.name == "status"
                         && command.target.is_none()
                     {
-                        if let Err(error) = self.publish_status() {
+                        if let Err(error) =
+                            self.publish_status(command.origin.map(usize::from))
+                        {
                             break error;
                         }
                         continue;
@@ -272,45 +377,61 @@ impl State {
                     continue;
                 }
             }
-            let frame = match Frame::decode(&bytes) {
-                Ok(frame) => frame,
-                Err(_) => break Status::InvalidArgument,
-            };
-            if frame.upgrade {
-                self.refuse(frame, 501).await;
-                continue;
-            }
-            let generation = match self.lifecycle.capture() {
-                Ok(Some(generation)) => generation,
-                Ok(None) => {
-                    self.refuse(frame, 503).await;
-                    continue;
-                }
-                Err(error) => break error,
-            };
-            if self.retained.fetch_add(1, Ordering::AcqRel)
-                >= self.options.max_exchanges
-            {
-                self.release_credit();
-                self.refuse(frame, 503).await;
-                continue;
-            }
-            let (exchange, input, output) =
-                Exchange::new(Arc::clone(self), frame, generation);
-            let id = match registry::insert_exchange(Arc::clone(&exchange)) {
-                Ok(id) => id,
-                Err(error) => {
-                    self.release_credit();
-                    break error;
-                }
-            };
-            self.running.fetch_add(1, Ordering::AcqRel);
-            tokio::spawn(async move {
-                exchange.drive(id, input, output).await;
-            });
         };
         drop(receiver);
         outcome
+    }
+
+    async fn start(
+        self: &Arc<Self>,
+        (bytes, admission): Start,
+    ) -> Result<()> {
+        let frame = Frame::decode(tokio_util::bytes::Bytes::from(bytes))
+            .map_err(|_| Status::InvalidArgument)?;
+        if admission
+            .as_ref()
+            .is_some_and(|(origin, _)| *origin != frame.origin as usize)
+        {
+            self.refuse(frame, 400).await;
+            drop(admission);
+            self.work_finished();
+            return Ok(());
+        }
+        if frame.upgrade && frame.stream.is_none() {
+            self.refuse(frame, 400).await;
+            drop(admission);
+            self.work_finished();
+            return Ok(());
+        }
+        let generation = match self.lifecycle.capture()? {
+            Some(generation) => generation,
+            None => {
+                self.refuse(frame, 503).await;
+                drop(admission);
+                self.work_finished();
+                return Ok(());
+            }
+        };
+        if self.retained.fetch_add(1, Ordering::AcqRel)
+            >= self.options.max_in_flight
+        {
+            self.refuse(frame, 503).await;
+            drop(admission);
+            self.release_credit();
+            return Ok(());
+        }
+        let (exchange, input, output) = Exchange::new(
+            Arc::clone(self),
+            frame,
+            generation,
+            admission.map(|(_, work)| work),
+        );
+        let id = registry::insert_exchange(Arc::clone(&exchange))?;
+        self.running.fetch_add(1, Ordering::AcqRel);
+        tokio::spawn(async move {
+            exchange.drive(id, input, output).await;
+        });
+        Ok(())
     }
 
     async fn finish(
@@ -344,11 +465,15 @@ impl State {
         status: u16,
     ) {
         let endpoint =
-            frame.body.and_then(|ticket| self.bodies.accept(ticket).ok());
+            frame.stream.and_then(|ticket| self.bodies.accept(ticket).ok());
         let output = endpoint.map(|endpoint| endpoint.split().1);
-        let _ = self.publish_head(&frame, status, Vec::new());
+        let published = self.publish_head(&frame, status, Vec::new()).is_ok();
         if let Some(mut output) = output {
-            let _ = output.shutdown().await;
+            if published {
+                let _ = output.shutdown().await;
+            } else {
+                output.reset();
+            }
         }
     }
 
@@ -358,18 +483,28 @@ impl State {
         status: u16,
         headers: Headers,
     ) -> Result<()> {
+        let bytes = Self::encode_head(frame, status, headers)?;
+        self.segment
+            .publish_reply(frame.origin as usize, &[&bytes])
+            .map_err(|_| Status::Transport)
+    }
+
+    fn encode_head(
+        frame: &Frame,
+        status: u16,
+        headers: Headers,
+    ) -> Result<Vec<u8>> {
         let head = ExchangeReply {
             correlation: frame.correlation,
             status,
             headers,
-            body: frame.body,
+            body: if frame.stream.is_some() {
+                claviron::orbit::link::application::ExchangeBody::Stream
+            } else {
+                claviron::orbit::link::application::ExchangeBody::Empty
+            },
         };
-        let bytes = head.encode().map_err(|_| Status::Capacity)?;
-        self.segment
-            .inbox()
-            .write(frame.origin as usize, &bytes)
-            .map(|_| ())
-            .map_err(|_| Status::Transport)
+        head.encode().map_err(|_| Status::Capacity)
     }
 }
 
@@ -406,6 +541,6 @@ impl State {
         if self.lifecycle.apply(action)? {
             self.event(EventKind::Lifecycle, 0, Status::Ok);
         }
-        self.publish_status()
+        self.publish_status(None)
     }
 }

@@ -1,6 +1,8 @@
 //! Isolated real-Link caller. The application under test is a Go executable.
 mod invoke;
 mod lifecycle;
+mod session;
+use claviron::orbit::link::application::ExchangeBody;
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::future::poll_fn;
@@ -113,8 +115,18 @@ async fn exchange(
     request: Exchange,
     body: &[u8],
 ) -> Result<(ExchangeReply, Vec<u8>)> {
-    let pending = client.send("app", request, !body.is_empty())?;
-    let (mut input, mut output, reply) = pending.split();
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: if !body.is_empty() {
+                ExchangeBody::Stream
+            } else {
+                ExchangeBody::Empty
+            },
+            ..request
+        },
+    )?;
+    let (mut input, mut output, reply, _) = pending.split();
     let write = async {
         if !body.is_empty() {
             input.write_all(body).await?;
@@ -137,6 +149,40 @@ async fn exchange(
     Ok(response)
 }
 
+// Route a fixture request deterministically without changing production selection.
+// Reservations fill sibling windows only until the request has been published.
+fn send_on(
+    client: &ApplicationClient,
+    segment: &ApplicationSegment,
+    application: &str,
+    target: usize,
+    request: Exchange,
+) -> Result<claviron::orbit::link::application::Pending> {
+    let mut held = Vec::new();
+    for lane in segment.inbox().serving(application) {
+        if lane == target {
+            continue;
+        }
+        let capacity = segment
+            .inbox()
+            .work_capacity(lane)?
+            .ok_or("missing receiver window")?;
+        for _ in 0..capacity {
+            match segment.reserve_work(lane, client.lane()) {
+                Ok(Some(reservation)) => held.push(reservation),
+                Err(
+                    claviron::orbit::link::application::Error::CapacityFull,
+                ) => break,
+                Ok(None) => {
+                    return Err("native receiver became unbounded".into());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(client.send(application, request)?)
+}
+
 async fn run(
     binary: PathBuf,
     example: PathBuf,
@@ -147,6 +193,7 @@ async fn run(
     assert_eq!(segment.inbox().role(first.lane)?.as_deref(), Some("go"));
     let client = ApplicationClient::join(fleet, "acceptance-caller", 1)?;
     assert!(client.serves("app"));
+    session::run(&client, &mut first).await?;
 
     let mut request = frame("/inspect%2Fname");
     request.method = "POST".into();
@@ -192,15 +239,15 @@ async fn run(
         exchange(&client, frame("/consume"), &vec![0; 1025]).await?.0.status,
         413
     );
-    let pending = client.send("app", frame("/abort"), false)?;
-    let (_write, _response_body, head) = pending.split();
+    let pending = client.send("app", frame("/abort"))?;
+    let (_write, _response_body, head, _) = pending.split();
     assert!(head.head().await.is_err());
     println!(
         "PASS bounded bodies, HEAD, panic-to-500 and explicit handler abort"
     );
 
-    let pending = client.send("app", frame("/panic-stream"), false)?;
-    let (_, mut failed_body, failed_head) = pending.split();
+    let pending = client.send("app", frame("/panic-stream"))?;
+    let (_, mut failed_body, failed_head, _) = pending.split();
     assert_eq!(failed_head.head().await?.status, 201);
     first.expect("PANIC_HEAD").await?;
     first.command("panic").await?;
@@ -209,7 +256,7 @@ async fn run(
         "PASS panic after a committed streaming head resets without rewriting status"
     );
 
-    let pending = client.send("app", frame("/wait"), false)?;
+    let pending = client.send("app", frame("/wait"))?;
     first.expect("WAIT").await?;
     drop(pending);
     first.expect("CANCELLED").await?;
@@ -225,9 +272,12 @@ async fn run(
     let (mut output, _) = endpoint.split();
     let mut request = frame("/");
     request.origin = u16::MAX;
-    request.body = Some(ticket);
+    request.stream = Some(ticket);
     let target = segment.inbox().targets("app")[0].0;
-    segment.inbox().write(target, &request.encode()?)?;
+    segment
+        .reserve_work(target, client.lane())?
+        .ok_or("bounded native receiver must advertise capacity")?
+        .publish(&[&request.encode()?])?;
     assert!(output.read_to_end(&mut Vec::new()).await.is_err());
     assert_eq!(exchange(&client, frame("/"), b"").await?.1, b"hello");
     println!(
@@ -253,6 +303,29 @@ async fn run(
                 .clone(),
         );
     }
+    // A bounded sender fills its preferred receiver; short work need not
+    // visit both. Fill one receiver's window to exercise the other explicitly.
+    assert_eq!(segment.inbox().serving("app").len(), 2);
+    for (lane, expected) in [
+        (first.lane, first.child.id().ok_or("first process exited")?),
+        (second.lane, second.child.id().ok_or("second process exited")?),
+    ] {
+        let (_, mut output, reply, _) =
+            send_on(&client, &segment, "app", lane, frame("/"))?.split();
+        let head = reply.head().await?;
+        let mut body = Vec::new();
+        output.read_to_end(&mut body).await?;
+        assert_eq!(body, b"hello");
+        let instance = head
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(b"x-instance"))
+            .ok_or("instance header missing")?
+            .1
+            .clone();
+        assert_eq!(instance, expected.to_string().as_bytes());
+        ids.insert(instance);
+    }
     assert_eq!(ids.len(), 2);
     let second_lane = second.lane;
     second.close().await?;
@@ -263,7 +336,7 @@ async fn run(
         "PASS concurrent requests, two same-name Go processes and isolated lane release"
     );
 
-    let pending = client.send("app", frame("/drain"), false)?;
+    let pending = client.send("app", frame("/drain"))?;
     first.expect("DRAIN").await?;
     segment.inbox().write(
         first.lane,
@@ -277,7 +350,7 @@ async fn run(
     }
     assert!(!client.serves("app"));
     first.command("release").await?;
-    let (_, mut output, reply) = pending.split();
+    let (_, mut output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     let mut body = Vec::new();
     output.read_to_end(&mut body).await?;
@@ -293,6 +366,7 @@ async fn run(
     segment.control(
         "app",
         &ControlCommand {
+            origin: Some(client.lane() as u16),
             application: "app".into(),
             name: "restart".into(),
             payload: Vec::new(),
@@ -325,9 +399,15 @@ async fn streaming(
 ) -> Result<()> {
     let mut app = App::start_mode(binary, fleet, "app", true).await?;
     // No input has been sent: reaching the Go handler proves intake is lazy.
-    let pending = client.send("app", frame("/read-gate"), true)?;
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: ExchangeBody::Stream,
+            ..frame("/read-gate")
+        },
+    )?;
     app.expect("READ_GATE").await?;
-    let (mut input, mut output, reply) = pending.split();
+    let (mut input, mut output, reply, _) = pending.split();
     input.write_all(&vec![b'x'; LINK_BUFFER_BYTES]).await?;
     poll_fn(|cx| match Pin::new(&mut input).poll_write(cx, b"x") {
         Poll::Pending => Poll::Ready(Ok::<_, Box<dyn Error + Send + Sync>>(())),
@@ -356,25 +436,37 @@ async fn streaming(
         "PASS lazy Go body reads, a provably full upload window, full-duplex flow and unrelated-request progress"
     );
 
-    let pending = client.send("app", frame("/read-close"), true)?;
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: ExchangeBody::Stream,
+            ..frame("/read-close")
+        },
+    )?;
     app.expect("READ_CLOSE_WAIT").await?;
     app.command("close-body").await?;
     app.expect("READ_CLOSED").await?;
-    let (_, mut output, reply) = pending.split();
+    let (_, mut output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 204);
     output.read_to_end(&mut Vec::new()).await?;
     println!(
         "PASS Body.Close interrupts a pending Read without cancelling the response"
     );
 
-    let pending = client.send("app", frame("/read-cancel"), true)?;
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: ExchangeBody::Stream,
+            ..frame("/read-cancel")
+        },
+    )?;
     app.expect("READ_WAIT").await?;
     drop(pending);
     app.expect("READ_CANCELLED").await?;
     let mut request = frame("/write-cancel");
     request.query = format!("window={LINK_BUFFER_BYTES}").into_bytes();
-    let pending = client.send("app", request, false)?;
-    let (_, output, reply) = pending.split();
+    let pending = client.send("app", request)?;
+    let (_, output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     app.expect("WRITE_WINDOW").await?;
     assert_eq!(exchange(client, frame("/"), b"").await?.1, b"hello");
@@ -384,13 +476,19 @@ async fn streaming(
         "PASS peer cancellation unblocks a pending native read and a full-window response write"
     );
 
-    let pending = client.send("app", frame("/read-cancel"), true)?;
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: ExchangeBody::Stream,
+            ..frame("/read-cancel")
+        },
+    )?;
     app.expect("READ_WAIT").await?;
     app.command("close").await?;
     app.expect("READ_CANCELLED").await?;
     app.expect("CLOSED").await?;
     assert!(app.child.wait().await?.success());
-    let (_, _response, reply) = pending.split();
+    let (_, _response, reply, _) = pending.split();
     assert!(reply.head().await.is_err());
     println!(
         "PASS explicit Close joins pending I/O and cancels owned request contexts"
@@ -399,8 +497,8 @@ async fn streaming(
     let mut drain = App::start_mode(binary, fleet, "app", true).await?;
     let mut request = frame("/write-drain");
     request.query = format!("window={LINK_BUFFER_BYTES}").into_bytes();
-    let pending = client.send("app", request, false)?;
-    let (_, mut output, reply) = pending.split();
+    let pending = client.send("app", request)?;
+    let (_, mut output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     drain.expect("WRITE_WINDOW").await?;
     let mut watcher = segment.link().watch("drain")?;
@@ -442,8 +540,14 @@ async fn example_streaming(
         ready.rsplit_once(' ').ok_or("example readiness")?.1.parse()?;
     let mut request = frame("/echo");
     request.method = "POST".into();
-    let pending = client.send("app", request, true)?;
-    let (mut input, mut output, reply) = pending.split();
+    let pending = client.send(
+        "app",
+        claviron::orbit::link::application::Exchange {
+            body: ExchangeBody::Stream,
+            ..request
+        },
+    )?;
+    let (mut input, mut output, reply, _) = pending.split();
     input.write_all(b"first").await?;
     assert_eq!(reply.head().await?.status, 200);
     let mut prefix = [0u8; 5];
@@ -470,8 +574,8 @@ async fn example_streaming(
 
     let mut request = frame("/stream");
     request.query = format!("bytes={}", LINK_BUFFER_BYTES * 4).into_bytes();
-    let pending = client.send("app", request, false)?;
-    let (_, mut output, reply) = pending.split();
+    let pending = client.send("app", request)?;
+    let (_, mut output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     let mut watcher = segment.link().watch("eg")?;
     let pid = child.id().ok_or("example pid")?.to_string();

@@ -24,7 +24,7 @@ func main() {
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(signals)
 	var endpoint atomic.Pointer[orbit.Invocations]
-	app, err := orbit.Open(orbit.Options{Fleet: *fleet, Name: "app", Incarnation: uint64(os.Getpid()), NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	app, err := orbit.Open(orbit.Options{Fleet: *fleet, Name: "app", Incarnation: uint64(os.Getpid()), NativeThreads: 1, MaxInFlight: 32, IOBufferBytes: 4096}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/invoke" {
 			client := endpoint.Load()
 			if client == nil {

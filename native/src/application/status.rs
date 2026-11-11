@@ -15,7 +15,10 @@ use super::State;
 use crate::abi::{Result, Status};
 
 impl State {
-    pub(super) fn publish_status(&self) -> Result<()> {
+    pub(super) fn publish_status(
+        &self,
+        to: Option<usize>,
+    ) -> Result<()> {
         let now = SystemTime::now();
         let state = self.lifecycle.snapshot()?;
         let member = FleetMember {
@@ -53,7 +56,7 @@ impl State {
         let rows = encode_link_snapshot_rows(&snapshot, member)
             .map_err(|_| Status::Capacity)?;
         self.segment
-            .publish_application_state(&self.options.name, &rows)
+            .publish_application_state(&self.options.name, &rows, to)
             .map_err(|_| Status::Transport)?;
         Ok(())
     }

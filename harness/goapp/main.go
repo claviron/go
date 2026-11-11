@@ -34,7 +34,7 @@ func main() {
 	}
 	var owner atomic.Pointer[orbit.Application]
 	app, err := orbit.Open(orbit.Options{Fleet: os.Args[1], Name: os.Args[2], Incarnation: 1,
-		NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096, MaxRequestBytes: limit, MaxResponseBytes: limit},
+		NativeThreads: 1, MaxInFlight: 32, IOBufferBytes: 4096, MaxRequestBytes: limit, MaxResponseBytes: limit, Sessions: serveSession},
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/generation":
@@ -245,5 +245,65 @@ func main() {
 			return
 		}
 		<-finished
+	}
+}
+
+// serveSession is the acceptance fixture for message sessions.
+func serveSession(offer *orbit.SessionRequest) {
+	switch offer.Request.URL.Path {
+	case "/session-reject":
+		_ = offer.Reject(403, http.Header{"X-Refused": {offer.Request.Header.Get("X-Token")}})
+	case "/session-silent":
+	case "/session-panic":
+		panic("session handler failed")
+	case "/session-end":
+		if _, err := offer.Accept(16, nil); err != nil {
+			panic(err)
+		}
+	case "/session-close":
+		session, err := offer.Accept(16, nil)
+		if err != nil {
+			panic(err)
+		}
+		if err = session.Close(4000, "bye"); err != nil {
+			panic(err)
+		}
+		if err = session.SendText("late"); err != orbit.ErrClosed {
+			panic(fmt.Sprintf("send after close: %v", err))
+		}
+	default:
+		session, err := offer.Accept(16, http.Header{"X-Accepted": {string(offer.Kind)}})
+		if err != nil {
+			panic(err)
+		}
+		if err = session.SendBinary(make([]byte, 17)); err != orbit.ErrMessageTooLarge {
+			panic(fmt.Sprintf("oversized send: %v", err))
+		}
+		for {
+			message, err := session.Receive()
+			if err == orbit.ErrMessageTooLarge {
+				fmt.Println("SESSION_TOO_LARGE")
+				return
+			}
+			if err == io.EOF {
+				fmt.Println("SESSION_END")
+				return
+			}
+			if err != nil {
+				panic(err)
+			}
+			switch message.Kind {
+			case orbit.MessageText:
+				err = session.SendText(string(message.Data))
+			case orbit.MessageBinary:
+				err = session.SendBinary(message.Data)
+			case orbit.MessageClose:
+				fmt.Printf("SESSION_CLOSE %d %s\n", message.Code, message.Data)
+				return
+			}
+			if err != nil {
+				panic(err)
+			}
+		}
 	}
 }

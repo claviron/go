@@ -90,7 +90,7 @@ pub fn remove_exchange(
         }
         registry.exchanges.remove(&id).ok_or(Status::InvalidHandle)?
     };
-    removed.application.release_credit();
+    drop(removed);
     Ok(())
 }
 

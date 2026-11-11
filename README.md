@@ -19,8 +19,16 @@ Go process and native I/O runtime. Public event subscriptions remain a later sta
 frames outside the supported lifecycle/status contract are counted by
 `UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
-It uses the Link application API of the published Claviron named in its
-manifest.
+The source targets Claviron 0.2.0-alpha.26. Rebuild the native library with the
+matching Edge version; a Go/native ABI match alone does not establish Link wire
+compatibility.
+
+Go owns a dedicated multi-thread Orbit I/O runtime sized by `NativeThreads`.
+`inherit`, running Orbit I/O on the host's own loop, is reserved and unavailable.
+
+`MaxInFlight` bounds running exchanges and must be positive. `MaxQueued`
+bounds waiting exchanges and may be zero. Their sum must be below the Link
+inbox capacity. Waiting work uses the native Link queue.
 
 ## Install
 
@@ -62,7 +70,7 @@ import (
 func main() {
     app, err := orbit.Open(orbit.Options{
         Fleet: "example", Name: "hello", Incarnation: 1,
-        NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: 4096,
+        NativeThreads: 1, MaxInFlight: 32, IOBufferBytes: 4096,
         MaxRequestBytes: 0, MaxResponseBytes: 0,
     }, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -121,7 +129,8 @@ Request.Body.Close interrupts a pending read without cancelling the response.
 
 The Link body API currently carries byte streams, so trailers are not exposed
 by this adapter. Declared request trailers are rejected; response trailers,
-informational responses, hijacking and upgrades are unsupported.
+informational responses and hijacking are unsupported. WebSocket and WebTransport
+requests go to `Options.Sessions`, described below, never to the HTTP handler.
 
 The complete Go example has three routes:
 
@@ -131,6 +140,53 @@ The complete Go example has three routes:
 
 Its `--io-buffer-bytes`, `--max-request-bytes` and `--max-response-bytes` flags
 configure the budgets. Signal handling belongs to the example, not the library.
+
+## WebSocket and WebTransport
+
+Claviron terminates the protocol and the client's connection. Your application
+decides whether to accept, and then exchanges whole messages; it never sees a
+socket, a frame or a handshake. Both protocols use the same API:
+
+```go
+app, err := orbit.Open(orbit.Options{
+	// identity and budgets as above
+	Sessions: func(offer *orbit.SessionRequest) {
+		if offer.Request.Header.Get("Authorization") == "" {
+			_ = offer.Reject(http.StatusUnauthorized, nil)
+			return
+		}
+		session, err := offer.Accept(64*1024, nil)
+		if err != nil {
+			return
+		}
+		for {
+			message, err := session.Receive()
+			if err != nil || message.Kind == orbit.MessageClose {
+				return
+			}
+			if message.Kind == orbit.MessageText {
+				err = session.SendText(string(message.Data))
+			} else {
+				err = session.SendBinary(message.Data)
+			}
+			if err != nil {
+				return
+			}
+		}
+	},
+}, handler)
+```
+
+The client has not been answered while the handler decides, so authentication
+belongs here and `Reject` reaches the client as a real HTTP status. Without
+`Sessions` these requests are refused with 501.
+
+`Receive` and one send may run at the same time from different goroutines. A
+received close is answered for you. Return after `Close` to end cleanly; ending
+without one is reported to the client as 1011. An accepted session holds one
+`MaxInFlight` slot for its whole life and keeps `Shutdown` waiting until it ends,
+so end long-lived sessions when you begin shutting down. Stopping or restarting the
+application cancels them.
 
 ## Application lifecycle
 
@@ -275,7 +331,7 @@ same-host Link capability; domain authorization belongs in the handler.
 
 ## ABI migration
 
-ABI v4 adds separate invoke owners, retained call/handler handles and signalled
+ABI v6 adds `MaxInFlight` and `MaxQueued` for receiver admission. ABI v5 added message sessions. ABI v4 added separate invoke owners, retained call/handler handles and signalled
 completion delivery to v3 lifecycle/streaming operations. Use the Go package and
 the native library of one version together. Older bindings are rejected before joining;
 the version-query record keeps its original extent so they can query safely. Go

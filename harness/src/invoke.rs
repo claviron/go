@@ -221,8 +221,8 @@ pub async fn run(
     );
 
     // Both protocols have accepted work before application shutdown.
-    let pending = http.send("app", frame("/hold-invoke"), false)?;
-    let (_, mut body, reply) = pending.split();
+    let pending = http.send("app", frame("/hold-invoke"))?;
+    let (_, mut body, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     app.expect("HTTP_HELD").await?;
     let caller = client.clone();

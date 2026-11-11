@@ -4,7 +4,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* ABI 4. Inputs live only for the call; native never retains Go pointers.
+#define OG_ABI_VERSION 6u
+
+/* ABI 6. Inputs live only for the call; native never retains Go pointers.
  * Outputs must be aligned and writable. Copy-out buffers may not overlap inputs.
  * Status: 0 OK, 1 invalid argument, 2 stale/wrong-kind handle, 3 closed,
  * 4 capacity, 5 unsupported, 6 transport, 7 contained panic, 8 busy, 9 cancelled, 10 body limit.
@@ -16,13 +18,13 @@ typedef struct {
 } og_abi_info;
 typedef struct {
     uint32_t abi_version, native_threads;
-    uint64_t incarnation, max_exchanges, max_request_bytes, max_response_bytes, io_buffer_bytes;
+    uint64_t incarnation, max_in_flight, max_queued, max_request_bytes, max_response_bytes, io_buffer_bytes;
 } og_options;
 typedef struct { uint32_t kind, status; uint64_t exchange; } og_event;
 typedef struct {
     uint32_t version_major, version_minor, header_count, body_stream;
     uint64_t generation;
-    uint32_t cancelled, reserved;
+    uint32_t cancelled, session;
 } og_request_info_record;
 typedef struct { uint64_t generation, revision, running; } og_snapshot_record;
 uint32_t og_abi(og_abi_info *out);
@@ -64,6 +66,16 @@ uint32_t og_output_result(uint64_t exchange, uint64_t *written);
 uint32_t og_read_start(uint64_t exchange, uint64_t capacity);
 uint32_t og_read_result(uint64_t exchange, uint8_t *out, uint64_t capacity, uint64_t *length);
 uint32_t og_read_close(uint64_t exchange);
+/* A request with session set is a message session: answer it with
+ * og_session_begin + og_head_submit (the Link's 101, never the wire handshake)
+ * or a 3xx-5xx head + og_output_finish. Body read/write calls are unsupported on
+ * it. Messages share the exchange's one read and one output slot, and complete
+ * through events 5 and 6. Read kinds: 0 end, 1 text, 2 binary, 3 close (code set;
+ * data is the reason). A peer's close is answered natively and ends the session. */
+uint32_t og_session_begin(uint64_t exchange, uint32_t max_message_bytes);
+uint32_t og_message_read_start(uint64_t exchange);
+uint32_t og_message_read_result(uint64_t exchange, uint32_t *kind, uint32_t *code, uint8_t *out, uint64_t capacity, uint64_t *length, uint32_t consume);
+uint32_t og_message_write(uint64_t exchange, uint32_t kind, uint32_t code, const uint8_t *data, uint64_t length);
 uint32_t og_exchange_cancel(uint64_t exchange);
 uint32_t og_exchange_release(uint64_t app, uint64_t exchange);
 /* Invoke is a separate application-owned Link, sharing the application's I/O

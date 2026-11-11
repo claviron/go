@@ -4,7 +4,7 @@ use super::*;
 fn abi_layout_and_invalid_arguments_are_explicit() {
     let mut abi = Abi::default();
     assert_eq!(unsafe { og_abi(&mut abi) }, 0);
-    assert_eq!(abi.version, 4);
+    assert_eq!(abi.version, 6);
     assert_eq!(abi.event_size as usize, size_of::<Event>());
     assert_eq!(
         unsafe { og_abi(ptr::null_mut()) },
@@ -31,7 +31,8 @@ fn incompatible_abi_is_rejected_before_join() {
         abi_version: u32::MAX,
         native_threads: 1,
         incarnation: 1,
-        max_exchanges: 1,
+        max_in_flight: 1,
+        max_queued: 0,
         max_request_bytes: 1,
         max_response_bytes: 1,
         io_buffer_bytes: 1,

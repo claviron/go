@@ -67,7 +67,7 @@ func main() {
 		fmt.Fprintln(w, "Hello from Go")
 	})
 	app, err := orbit.Open(orbit.Options{Fleet: *fleet, Name: *name, Incarnation: 1,
-		NativeThreads: 1, MaxExchanges: 32, IOBufferBytes: *buffer,
+		NativeThreads: 1, MaxInFlight: 32, IOBufferBytes: *buffer,
 		MaxRequestBytes: *maxRequest, MaxResponseBytes: *maxResponse}, mux)
 	if err != nil {
 		log.Fatal(err)

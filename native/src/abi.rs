@@ -1,4 +1,4 @@
-//! C ABI version four: checked handles, borrowed call inputs and copy-out data.
+//! C ABI version six: checked handles, borrowed call inputs and copy-out data.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -8,6 +8,7 @@ use claviron::orbit::link::application::{self as link, HttpVersion};
 use crate::{application::Application, registry};
 
 pub type Result<T> = std::result::Result<T, Status>;
+const ABI_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -64,7 +65,8 @@ pub struct OpenOptions {
     pub abi_version: u32,
     pub native_threads: u32,
     pub incarnation: u64,
-    pub max_exchanges: u64,
+    pub max_in_flight: u64,
+    pub max_queued: u64,
     pub max_request_bytes: u64,
     pub max_response_bytes: u64,
     pub io_buffer_bytes: u64,
@@ -75,21 +77,27 @@ pub struct Options {
     pub name: Box<str>,
     pub native_threads: usize,
     pub incarnation: u64,
-    pub max_exchanges: usize,
+    pub max_in_flight: usize,
+    pub max_queued: usize,
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub io_buffer_bytes: usize,
 }
 
 impl Options {
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<usize> {
+        let window = self
+            .max_in_flight
+            .checked_add(self.max_queued)
+            .ok_or(Status::InvalidArgument)?;
         if self.native_threads == 0
             || self.incarnation == 0
-            || self.max_exchanges == 0
+            || self.max_in_flight == 0
+            || window >= link::LINK_INBOX_CAPACITY
             || self.io_buffer_bytes == 0
             || self.io_buffer_bytes > isize::MAX as usize
             || self
-                .max_exchanges
+                .max_in_flight
                 .checked_mul(5)
                 .and_then(|n| n.checked_add(2))
                 .is_none()
@@ -99,7 +107,8 @@ impl Options {
         claviron::orbitive::FleetName::try_new(&self.fleet)
             .map_err(|_| Status::InvalidArgument)?;
         link::segment::check_application_name(&self.name)
-            .map_err(|_| Status::InvalidArgument)
+            .map_err(|_| Status::InvalidArgument)?;
+        Ok(window)
     }
 }
 
@@ -112,7 +121,7 @@ pub struct RequestInfo {
     pub body_stream: u32,
     pub generation: u64,
     pub cancelled: u32,
-    pub reserved: u32,
+    pub session: u32,
 }
 
 pub(crate) fn boundary(action: impl FnOnce() -> Result<()>) -> u32 {
@@ -187,7 +196,7 @@ pub unsafe extern "C" fn og_abi(out: *mut Abi) -> u32 {
         output(
             out,
             Abi {
-                version: 4,
+                version: ABI_VERSION,
                 event_size: size_of::<Event>() as u32,
                 options_size: size_of::<OpenOptions>() as u32,
                 info_size: size_of::<RequestInfo>() as u32,
@@ -220,10 +229,10 @@ pub unsafe extern "C" fn og_open(
         unsafe {
             out.write(0);
         }
-        let options = unsafe { &*options };
-        if options.abi_version != 4 {
+        if unsafe { options.cast::<u32>().read() } != ABI_VERSION {
             return Err(Status::Unsupported);
         }
+        let options = unsafe { &*options };
         let fleet = std::str::from_utf8(unsafe { bytes(fleet, fleet_len)? })
             .map_err(|_| Status::InvalidArgument)?;
         let name = std::str::from_utf8(unsafe { bytes(name, name_len)? })
@@ -233,7 +242,9 @@ pub unsafe extern "C" fn og_open(
             name: name.into(),
             incarnation: options.incarnation,
             native_threads: options.native_threads as usize,
-            max_exchanges: usize::try_from(options.max_exchanges)
+            max_in_flight: usize::try_from(options.max_in_flight)
+                .map_err(|_| Status::InvalidArgument)?,
+            max_queued: usize::try_from(options.max_queued)
                 .map_err(|_| Status::InvalidArgument)?,
             max_request_bytes: usize::try_from(options.max_request_bytes)
                 .map_err(|_| Status::InvalidArgument)?,
@@ -314,10 +325,13 @@ pub unsafe extern "C" fn og_request_info(
             version_major: major,
             version_minor: minor,
             header_count: exchange.frame.headers.len() as u32,
-            body_stream: u32::from(exchange.frame.body.is_some()),
+            body_stream: u32::from(!matches!(
+                exchange.frame.body,
+                claviron::orbit::link::application::ExchangeBody::Empty
+            )),
             generation: exchange.generation.id,
             cancelled: u32::from(exchange.cancel.is_cancelled()),
-            reserved: 0,
+            session: u32::from(exchange.frame.upgrade),
         };
         unsafe { output(out, info) }
     })
@@ -443,6 +457,74 @@ pub unsafe extern "C" fn og_unsupported(
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn og_session_begin(
+    exchange: u64,
+    max_message_bytes: u32,
+) -> u32 {
+    boundary(|| registry::exchange(exchange)?.begin_session(max_message_bytes))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn og_message_read_start(exchange: u64) -> u32 {
+    boundary(|| registry::exchange(exchange)?.read_message())
+}
+/// # Safety
+/// kind and code are writable for one u32 and length for one u64. Requires the
+/// read event. NULL/0 with consume 0 reports the length; consume 1 copies the
+/// message and releases the read credit, returning the read's own status.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_message_read_result(
+    exchange: u64,
+    kind: *mut u32,
+    code: *mut u32,
+    out: *mut u8,
+    capacity: u64,
+    length: *mut u64,
+    consume: u32,
+) -> u32 {
+    boundary(|| {
+        let (message_kind, message_code) = registry::exchange(exchange)?
+            .message_result(consume != 0, |data| unsafe {
+                copy_out(data, out, capacity, length)
+            })?;
+        unsafe {
+            output(kind, message_kind)?;
+            output(code, message_code)
+        }
+    })
+}
+/// # Safety
+/// data is a call-scoped input. Native copies it before returning and completes
+/// through the output-result event. kind: 1 text, 2 binary, 3 close with code.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn og_message_write(
+    exchange: u64,
+    kind: u32,
+    code: u32,
+    data: *const u8,
+    length: u64,
+) -> u32 {
+    boundary(|| {
+        use crate::application::{MESSAGE_BINARY, MESSAGE_CLOSE, MESSAGE_TEXT};
+        let data = unsafe { bytes(data, length)? };
+        let text = || {
+            std::str::from_utf8(data)
+                .map(str::to_owned)
+                .map_err(|_| Status::InvalidArgument)
+        };
+        let message = match kind {
+            MESSAGE_TEXT => link::Message::Text(text()?),
+            MESSAGE_BINARY => link::Message::Binary(data.to_vec()),
+            MESSAGE_CLOSE => link::Message::Close {
+                code: u16::try_from(code)
+                    .map_err(|_| Status::InvalidArgument)?,
+                reason: text()?,
+            },
+            _ => return Err(Status::InvalidArgument),
+        };
+        registry::exchange(exchange)?.write_message(message)
+    })
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn og_head_submit(exchange: u64) -> u32 {
     boundary(|| registry::exchange(exchange)?.head())

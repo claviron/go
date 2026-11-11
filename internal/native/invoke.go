@@ -30,7 +30,7 @@ func InvokeOpen(app Handle, o InvokeOptions) (Handle, error) {
 	if err := check(C.og_abi(&abi)); err != nil {
 		return 0, err
 	}
-	if abi.version != 4 || unsafe.Sizeof(C.og_invoke_options{}) != 40 || unsafe.Sizeof(C.og_invoke_info{}) != 16 {
+	if abi.version != C.OG_ABI_VERSION || unsafe.Sizeof(C.og_invoke_options{}) != 40 || unsafe.Sizeof(C.og_invoke_info{}) != 16 {
 		return 0, fmt.Errorf("orbit: incompatible invoke ABI")
 	}
 	var routes []byte

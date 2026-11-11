@@ -40,6 +40,7 @@ impl<'a> Controller<'a> {
         target: Option<ControlTarget>,
     ) -> Result<()> {
         let frame = ControlCommand {
+            origin: Some(self.lane as u16),
             application: name.into(),
             name: action.into(),
             payload: Vec::new(),
@@ -136,8 +137,8 @@ pub(super) async fn fixtures(
     for _ in 0..4 {
         assert_eq!(exchange(client, frame("/"), b"").await?.0.status, 503);
     }
-    let pending = client.send("other", frame("/generation"), false)?;
-    let (_, mut output, reply) = pending.split();
+    let pending = client.send("other", frame("/generation"))?;
+    let (_, mut output, reply, _) = pending.split();
     assert_eq!(reply.head().await?.status, 200);
     let mut value = String::new();
     output.read_to_string(&mut value).await?;
@@ -162,15 +163,17 @@ pub(super) async fn fixtures(
         "PASS lifecycle stop/start fan-out, retained memberships, wrong-target isolation and generation context cancellation"
     );
 
-    let old_a = client.send("app", frame("/late"), false)?;
-    let old_b = client.send("app", frame("/late"), false)?;
+    let old_a =
+        super::send_on(client, segment, "app", first.lane, frame("/late"))?;
+    let old_b =
+        super::send_on(client, segment, "app", second.lane, frame("/late"))?;
     first.expect("LATE 2").await?;
     second.expect("LATE 2").await?;
     control.action(first.lane, "app", "restart")?;
     control.wait(first.lane, 3, true, 0).await?;
     control.wait(second.lane, 3, true, 0).await?;
-    let (_, _old_body_a, old_head_a) = old_a.split();
-    let (_, _old_body_b, old_head_b) = old_b.split();
+    let (_, _old_body_a, old_head_a, _) = old_a.split();
+    let (_, _old_body_b, old_head_b, _) = old_b.split();
     assert!(old_head_a.head().await.is_err());
     assert!(old_head_b.head().await.is_err());
     assert_eq!(exchange(client, frame("/generation"), b"").await?.1, b"3");
@@ -213,8 +216,8 @@ pub(super) async fn example(
     pid: u32,
 ) -> Result<()> {
     let mut control = Controller::new(segment)?;
-    let pending = client.send("app", frame("/wait-generation"), false)?;
-    let (_, mut output, reply) = pending.split();
+    let pending = client.send("app", frame("/wait-generation"))?;
+    let (_, mut output, reply, _) = pending.split();
     let head = reply.head().await?;
     assert_eq!(head.status, 200);
     assert!(

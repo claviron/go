@@ -15,16 +15,20 @@ import (
 var ErrClosed = errors.New("orbit: application is closed")
 
 // Options declares application identity and native resource budgets. Identity,
-// NativeThreads, MaxExchanges and IOBufferBytes are required. The library invents
+// NativeThreads, MaxInFlight and IOBufferBytes are required. The library invents
 // no timeout, retry policy or worker count.
+// MaxQueued counts waiting exchanges only. Zero uses direct intake.
 // IOBufferBytes bounds each pending read/write. Zero total body limits disable
 // that limit; they do not change the bounded stream window or operation size.
 type Options struct {
-	Fleet, Name                                     string
-	Incarnation                                     uint64
-	NativeThreads                                   uint32
-	MaxExchanges, MaxRequestBytes, MaxResponseBytes uint64
-	IOBufferBytes                                   uint64
+	Fleet, Name                                               string
+	Incarnation                                               uint64
+	NativeThreads                                             uint32
+	MaxInFlight, MaxQueued, MaxRequestBytes, MaxResponseBytes uint64
+	IOBufferBytes                                             uint64
+	// Sessions answers WebSocket and WebTransport requests. Without it they are
+	// refused with 501 and never reach the HTTP handler.
+	Sessions SessionHandler
 }
 
 type exchangeState struct {
@@ -62,10 +66,15 @@ type Application struct {
 // Dispatch may begin before Open returns; handler state must already be ready.
 func Open(options Options, handler http.Handler) (*Application, error) {
 	maxInt := uint64(int(^uint(0) >> 1))
-	if handler == nil || options.Fleet == "" || options.Name == "" || options.Incarnation == 0 || options.NativeThreads == 0 || options.MaxExchanges == 0 || options.IOBufferBytes == 0 || options.IOBufferBytes > maxInt || options.MaxRequestBytes > maxInt || options.MaxResponseBytes > maxInt {
+	if handler == nil || options.Fleet == "" || options.Name == "" || options.Incarnation == 0 || options.NativeThreads == 0 || options.MaxInFlight == 0 || options.IOBufferBytes == 0 || options.IOBufferBytes > maxInt || options.MaxRequestBytes > maxInt || options.MaxResponseBytes > maxInt {
 		return nil, fmt.Errorf("orbit: a handler, identity and positive resource budgets are required")
 	}
-	handle, lane, err := native.Open(native.Options{Fleet: options.Fleet, Name: options.Name, Incarnation: options.Incarnation, NativeThreads: options.NativeThreads, MaxExchanges: options.MaxExchanges, MaxRequestBytes: options.MaxRequestBytes, MaxResponseBytes: options.MaxResponseBytes, IOBufferBytes: options.IOBufferBytes})
+	handle, lane, err := native.Open(native.Options{
+		Fleet: options.Fleet, Name: options.Name, Incarnation: options.Incarnation,
+		NativeThreads: options.NativeThreads, IOBufferBytes: options.IOBufferBytes,
+		MaxInFlight: options.MaxInFlight, MaxQueued: options.MaxQueued,
+		MaxRequestBytes: options.MaxRequestBytes, MaxResponseBytes: options.MaxResponseBytes,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +193,11 @@ func (a *Application) pump() {
 			a.active[event.Exchange] = &exchangeState{cancel: cancel, readDone: make(chan struct{}, 1), outputDone: make(chan struct{}, 1)}
 			a.workers.Add(1)
 			a.mu.Unlock()
-			go a.dispatch(event.Exchange, request, ctx, err)
+			if request.Session {
+				go a.dispatchSession(event.Exchange, request, ctx, err)
+			} else {
+				go a.dispatch(event.Exchange, request, ctx, err)
+			}
 		case 2:
 			a.mu.Lock()
 			if state := a.active[event.Exchange]; state != nil {
