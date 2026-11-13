@@ -4,11 +4,12 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use claviron::orbit::link::application::body::ResponseWriter;
 use claviron::orbit::link::application::{
-    Exchange as Frame, Headers, LINK_INBOX_PAYLOAD_CAPACITY, Message,
+    Exchange as Frame, ExchangeBody, Headers, LINK_INBOX_PAYLOAD_CAPACITY, Message,
     MessageReader, write_message,
 };
-use claviron::orbitive::stream::{ReadHalf, WriteHalf};
+use claviron::orbitive::stream::ReadHalf;
 use futures_util::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
@@ -25,6 +26,8 @@ const MESSAGE_END: u32 = 0;
 pub(crate) const MESSAGE_TEXT: u32 = 1;
 pub(crate) const MESSAGE_BINARY: u32 = 2;
 pub(crate) const MESSAGE_CLOSE: u32 = 3;
+
+pub(super) type HttpBodies = (Option<ReadHalf>, Option<ResponseWriter>);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
@@ -497,8 +500,9 @@ impl Exchange {
         id: u64,
         input: mpsc::Receiver<usize>,
         output: mpsc::Receiver<Command>,
+        bodies: HttpBodies,
     ) {
-        let outcome = AssertUnwindSafe(self.perform(id, input, output))
+        let outcome = AssertUnwindSafe(self.perform(id, input, output, bodies))
             .catch_unwind()
             .await
             .unwrap_or(Err(Status::Panic));
@@ -526,19 +530,8 @@ impl Exchange {
         id: u64,
         reads: mpsc::Receiver<usize>,
         writes: mpsc::Receiver<Command>,
+        (input, mut output): HttpBodies,
     ) -> Result<()> {
-        let (input, output) = match self.frame.stream {
-            Some(ticket) => {
-                let (read, write) = self
-                    .application
-                    .bodies
-                    .accept(ticket)
-                    .map_err(|_| Status::Transport)?
-                    .split();
-                (Some(read), Some(write))
-            }
-            None => (None, None),
-        };
         let reader = Arc::clone(self);
         // Own and join the reader even if output fails; no detached I/O task.
         let read = async {
@@ -555,10 +548,15 @@ impl Exchange {
         };
         let write = async {
             let result =
-                AssertUnwindSafe(self.write_driver(id, output, writes))
+                AssertUnwindSafe(self.write_driver(id, &mut output, writes))
                     .catch_unwind()
                     .await
                     .unwrap_or(Err(Status::Panic));
+            if result.is_err()
+                && let Some(output) = output.as_mut()
+            {
+                output.reset();
+            }
             self.input_stop.cancel();
             result
         };
@@ -730,11 +728,11 @@ impl Exchange {
     /// observations, never codes sent on the wire.
     async fn answer_close(
         &self,
-        output: &mut Option<WriteHalf>,
+        output: &mut Option<ResponseWriter>,
     ) -> Result<()> {
         let close = self.peer_close.lock().map_err(|_| Status::Panic)?.take();
         self.output.lock().map_err(|_| Status::Panic)?.phase = Phase::Finished;
-        let Some(output) = output.as_mut() else { return Ok(()) };
+        let Some(ResponseWriter::ByteStream(output)) = output.as_mut() else { return Ok(()) };
         if let Some((code, reason)) = close
             && !matches!(code, 1005 | 1006)
         {
@@ -749,11 +747,12 @@ impl Exchange {
         &self,
         status: u16,
         headers: Headers,
-        output: &mut Option<WriteHalf>,
+        output: &mut Option<ResponseWriter>,
     ) -> Result<()> {
         use claviron::orbit::link::application::Error as LinkError;
 
-        let bytes = State::encode_head(&self.frame, status, headers)?;
+        let body = if output.is_some() { ExchangeBody::Stream } else { ExchangeBody::Empty };
+        let bytes = State::encode_head(&self.frame, status, headers, body)?;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(Status::Cancelled);
@@ -781,7 +780,7 @@ impl Exchange {
     async fn write_driver(
         &self,
         id: u64,
-        mut output: Option<WriteHalf>,
+        output: &mut Option<ResponseWriter>,
         mut commands: mpsc::Receiver<Command>,
     ) -> Result<()> {
         loop {
@@ -790,7 +789,7 @@ impl Exchange {
                 () = self.cancel.cancelled() => return Err(Status::Cancelled),
                 // A session's edge leaves right after its last record, which
                 // the input owner has still to read: its end is not a cancel.
-                _ = peer_closed(&mut output), if !self.frame.upgrade => return Err(Status::Cancelled),
+                _ = peer_closed(output), if !self.frame.upgrade => return Err(Status::Cancelled),
                 command = commands.recv() => command.ok_or(Status::Cancelled)?,
                 () = self.closing.notified() => {
                     // A peer already gone cannot receive the answer; the close
@@ -798,7 +797,7 @@ impl Exchange {
                     tokio::select! {
                         biased;
                         () = self.cancel.cancelled() => {},
-                        _ = self.answer_close(&mut output) => {},
+                        _ = self.answer_close(output) => {},
                     }
                     return Ok(());
                 }
@@ -809,17 +808,20 @@ impl Exchange {
                 Command::Finish | Command::Message(Message::Close { .. })
             );
             let result = match command {
-                Command::Head(status, headers) => {
-                    self.publish_head(status, headers, &mut output).await
-                }
+                Command::Head(status, headers) => async {
+                    self.publish_head(status, headers, output).await?;
+                    if let Some(output) = output.as_mut() {
+                        output.start().map_err(|_| Status::Cancelled)?;
+                    }
+                    Ok(())
+                }.await,
                 Command::Write(bytes) => tokio::select! {
                     biased;
                     () = self.cancel.cancelled() => Err(Status::Cancelled),
                     result = async {
                         let output = output.as_mut().ok_or(Status::Unsupported)?;
                         while written < bytes.len() {
-                            let n = output.write(&bytes[written..]).await.map_err(|_| Status::Cancelled)?;
-                            if n == 0 { return Err(Status::Transport); }
+                            let n = output.write_chunk(&bytes[written..]).await.map_err(|_| Status::Cancelled)?;
                             written += n;
                         }
                         Ok(())
@@ -829,7 +831,9 @@ impl Exchange {
                     biased;
                     () = self.cancel.cancelled() => Err(Status::Cancelled),
                     result = async {
-                        let output = output.as_mut().ok_or(Status::Unsupported)?;
+                        let Some(ResponseWriter::ByteStream(output)) = output.as_mut() else {
+                            return Err(Status::Unsupported);
+                        };
                         write_message(output, &message).await.map_err(|_| Status::Cancelled)?;
                         if finish {
                             output.shutdown().await.map_err(|_| Status::Cancelled)?;
@@ -837,11 +841,15 @@ impl Exchange {
                         Ok(())
                     } => result,
                 },
-                Command::Finish => match output.as_mut() {
-                    Some(output) => {
-                        output.shutdown().await.map_err(|_| Status::Cancelled)
-                    }
-                    None => Ok(()),
+                Command::Finish => tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => Err(Status::Cancelled),
+                    result = async {
+                        if let Some(output) = output.as_mut() {
+                            output.finish().await.map_err(|_| Status::Cancelled)?;
+                        }
+                        Ok(())
+                    } => result,
                 },
             };
             self.output_complete(
@@ -876,7 +884,7 @@ pub(crate) fn validate_close(
     Ok(())
 }
 
-async fn peer_closed(output: &mut Option<WriteHalf>) {
+async fn peer_closed(output: &mut Option<ResponseWriter>) {
     match output {
         Some(output) => {
             let _ = output.peer_closed().await;

@@ -11,11 +11,10 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use claviron::orbit::link::application::{
     ApplicationBodies, ApplicationReceiver, ApplicationSegment, ControlCommand,
-    Exchange as Frame, ExchangeReply, FrameKind, Headers, Offered, Received,
+    Exchange as Frame, ExchangeBody, ExchangeReply, FrameKind, Headers, Offered, Received,
     ShutdownNotice, Start, WorkQueue, frame_kind,
 };
 use claviron::orbitive::shm::LaneHold;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -100,12 +99,15 @@ impl Application {
                 segment
                     .set_work_execution(joined.lane, options.max_in_flight)
                     .map_err(|_| Status::Transport)?;
-                let bodies = ApplicationBodies::for_segment(
+                let mut bodies = ApplicationBodies::for_segment(
                     &segment,
                     joined.lane,
                     options.incarnation,
                 )
                 .map_err(|_| Status::Transport)?;
+                bodies
+                    .prepare_http(&segment, joined.lane, options.incarnation)
+                    .map_err(|_| Status::Transport)?;
                 bodies.reclaimed(&joined.reclaimed);
                 let receiver = segment
                     .application_receiver(joined.lane)
@@ -310,7 +312,7 @@ impl State {
                         if let Ok(frame) = Frame::decode(
                             tokio_util::bytes::Bytes::copy_from_slice(&bytes),
                         ) {
-                            self.refuse(frame, 503).await;
+                            self.refuse(frame, 503);
                         }
                     }
                 }
@@ -326,7 +328,7 @@ impl State {
                     if let Ok(frame) = Frame::decode(
                         tokio_util::bytes::Bytes::copy_from_slice(&bytes),
                     ) {
-                        self.refuse(frame, 503).await;
+                        self.refuse(frame, 503);
                     }
                     continue;
                 }
@@ -394,13 +396,13 @@ impl State {
             .as_ref()
             .is_some_and(|(origin, _)| *origin != frame.origin as usize)
         {
-            self.refuse(frame, 400).await;
+            self.refuse(frame, 400);
             drop(admission);
             self.work_finished();
             return Ok(());
         }
         if frame.upgrade && frame.stream.is_none() {
-            self.refuse(frame, 400).await;
+            self.refuse(frame, 400);
             drop(admission);
             self.work_finished();
             return Ok(());
@@ -408,7 +410,7 @@ impl State {
         let generation = match self.lifecycle.capture()? {
             Some(generation) => generation,
             None => {
-                self.refuse(frame, 503).await;
+                self.refuse(frame, 503);
                 drop(admission);
                 self.work_finished();
                 return Ok(());
@@ -417,11 +419,16 @@ impl State {
         if self.retained.fetch_add(1, Ordering::AcqRel)
             >= self.options.max_in_flight
         {
-            self.refuse(frame, 503).await;
+            self.refuse(frame, 503);
             drop(admission);
             self.release_credit();
             return Ok(());
         }
+        let Ok(bodies) = self.bodies.accept_http(&frame) else {
+            drop(admission);
+            self.release_credit();
+            return Ok(());
+        };
         let (exchange, input, output) = Exchange::new(
             Arc::clone(self),
             frame,
@@ -431,7 +438,7 @@ impl State {
         let id = registry::insert_exchange(Arc::clone(&exchange))?;
         self.running.fetch_add(1, Ordering::AcqRel);
         tokio::spawn(async move {
-            exchange.drive(id, input, output).await;
+            exchange.drive(id, input, output, bodies).await;
         });
         Ok(())
     }
@@ -461,50 +468,43 @@ impl State {
         );
     }
 
-    async fn refuse(
+    fn refuse(
         &self,
         frame: Frame,
         status: u16,
     ) {
-        let endpoint =
-            frame.stream.and_then(|ticket| self.bodies.accept(ticket).ok());
-        let output = endpoint.map(|endpoint| endpoint.split().1);
-        let published = self.publish_head(&frame, status, Vec::new()).is_ok();
-        if let Some(mut output) = output {
-            if published {
-                let _ = output.shutdown().await;
+        let mut output = self
+            .bodies
+            .accept_http(&frame)
+            .ok()
+            .and_then(|(_, output)| output);
+        let published =
+            Self::encode_head(&frame, status, Vec::new(), ExchangeBody::Empty)
+                .and_then(|bytes| {
+                    self.segment
+                        .publish_reply(frame.origin as usize, &[&bytes])
+                        .map_err(|_| Status::Transport)
+                });
+        if let Some(output) = output.as_mut() {
+            if published.is_ok() {
+                let _ = output.finish_empty();
             } else {
                 output.reset();
             }
         }
     }
 
-    fn publish_head(
-        &self,
-        frame: &Frame,
-        status: u16,
-        headers: Headers,
-    ) -> Result<()> {
-        let bytes = Self::encode_head(frame, status, headers)?;
-        self.segment
-            .publish_reply(frame.origin as usize, &[&bytes])
-            .map_err(|_| Status::Transport)
-    }
-
     fn encode_head(
         frame: &Frame,
         status: u16,
         headers: Headers,
+        body: ExchangeBody,
     ) -> Result<Vec<u8>> {
         let head = ExchangeReply {
             correlation: frame.correlation,
             status,
             headers,
-            body: if frame.stream.is_some() {
-                claviron::orbit::link::application::ExchangeBody::Stream
-            } else {
-                claviron::orbit::link::application::ExchangeBody::Empty
-            },
+            body,
         };
         head.encode().map_err(|_| Status::Capacity)
     }
