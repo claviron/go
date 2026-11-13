@@ -19,7 +19,7 @@ Go process and native I/O runtime. Public event subscriptions remain a later sta
 frames outside the supported lifecycle/status contract are counted by
 `UnsupportedFrames`; they perform no operation or success acknowledgement. An edge-shutdown notice does not cancel another caller's work.
 
-The source targets Claviron 0.2.0-alpha.26. Rebuild the native library with the
+The source targets Claviron 0.2.1. Rebuild the native library with the
 matching Edge version; a Go/native ABI match alone does not establish Link wire
 compatibility.
 

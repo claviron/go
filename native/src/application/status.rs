@@ -56,7 +56,7 @@ impl State {
         let rows = encode_link_snapshot_rows(&snapshot, member)
             .map_err(|_| Status::Capacity)?;
         self.segment
-            .publish_application_state(&self.options.name, &rows, to)
+            .publish_application_state(&self.options.name, self.pid, &rows, to)
             .map_err(|_| Status::Transport)?;
         Ok(())
     }

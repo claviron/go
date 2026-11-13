@@ -128,8 +128,11 @@ impl Reader {
             }
             let mut guard =
                 self.ready.readable().await.map_err(|_| Status::Transport)?;
-            self.ready.get_ref().drain().map_err(|_| Status::Transport)?;
+            // Clear before draining: a signal that lands after the
+            // drain is the only one until the next drain, and
+            // clearing after would erase it.
             guard.clear_ready();
+            self.ready.get_ref().drain().map_err(|_| Status::Transport)?;
         }
     }
 }

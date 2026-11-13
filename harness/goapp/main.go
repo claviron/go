@@ -17,6 +17,7 @@ import (
 )
 
 func main() {
+	processID := fmt.Sprint(os.Getpid())
 	if len(os.Args) < 3 {
 		panic("usage: goapp <fleet> <name>")
 	}
@@ -166,7 +167,7 @@ func main() {
 			if r.Method == http.MethodHead {
 				w.Header().Set("Content-Length", "5")
 			}
-			w.Header().Set("X-Instance", fmt.Sprint(os.Getpid()))
+			w.Header().Set("X-Instance", processID)
 			_, _ = io.WriteString(w, "hello")
 		}))
 	if err != nil {
